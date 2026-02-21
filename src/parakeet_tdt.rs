@@ -97,6 +97,8 @@ impl Transcriber for ParakeetTDT {
         channels: u16,
         mode: Option<TimestampMode>,
     ) -> Result<TranscriptionResult> {
+        // Keep upstream's cached feature extraction (v0.3.6 perf win) AND our
+        // confidence return value from forward().
         let features = audio::extract_features_with_cache(
             audio,
             sample_rate,
@@ -104,12 +106,13 @@ impl Transcriber for ParakeetTDT {
             &self.preprocessor_config,
             &self.feature_cache,
         )?;
-        let (tokens, frame_indices, durations) = self.model.forward(features)?;
+        let (tokens, frame_indices, durations, confidences) = self.model.forward(features)?;
 
         let mut result = self.decoder.decode_with_timestamps(
             &tokens,
             &frame_indices,
             &durations,
+            &confidences,
             self.preprocessor_config.hop_length,
             self.preprocessor_config.sampling_rate,
         )?;
