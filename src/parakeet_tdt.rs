@@ -96,12 +96,13 @@ impl Transcriber for ParakeetTDT {
     ) -> Result<TranscriptionResult> {
         let features =
             audio::extract_features_raw(audio, sample_rate, channels, &self.preprocessor_config)?;
-        let (tokens, frame_indices, durations) = self.model.forward(features)?;
+        let (tokens, frame_indices, durations, confidences) = self.model.forward(features)?;
 
         let mut result = self.decoder.decode_with_timestamps(
             &tokens,
             &frame_indices,
             &durations,
+            &confidences,
             self.preprocessor_config.hop_length,
             self.preprocessor_config.sampling_rate,
         )?;

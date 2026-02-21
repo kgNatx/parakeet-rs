@@ -108,18 +108,19 @@ impl ParakeetTDTModel {
         )))
     }
 
-    /// Run greedy decoding - returns (token_ids, frame_indices, durations)
+    /// Run greedy decoding - returns (token_ids, frame_indices, durations, confidences)
     pub fn forward(
         &mut self,
         features: Array2<f32>,
-    ) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>)> {
+    ) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<f32>)> {
         // Run encoder
         let (encoder_out, encoder_len) = self.run_encoder(&features)?;
 
         // Run greedy decoding with decoder_joint
-        let (tokens, frame_indices, durations) = self.greedy_decode(&encoder_out, encoder_len)?;
+        let (tokens, frame_indices, durations, confidences) =
+            self.greedy_decode(&encoder_out, encoder_len)?;
 
-        Ok((tokens, frame_indices, durations))
+        Ok((tokens, frame_indices, durations, confidences))
     }
 
     fn run_encoder(&mut self, features: &Array2<f32>) -> Result<(Array3<f32>, i64)> {
@@ -177,7 +178,7 @@ impl ParakeetTDTModel {
         &mut self,
         encoder_out: &Array3<f32>,
         _encoder_len: i64,
-    ) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>)> {
+    ) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<f32>)> {
         // encoder_out shape: [batch, encoder_dim, time]
         let encoder_dim = encoder_out.shape()[1];
         let time_steps = encoder_out.shape()[2];
@@ -192,6 +193,7 @@ impl ParakeetTDTModel {
         let mut tokens = Vec::new();
         let mut frame_indices = Vec::new();
         let mut durations = Vec::new();
+        let mut confidences = Vec::new();
 
         let mut t = 0;
         let mut emitted_tokens = 0;
@@ -235,6 +237,18 @@ impl ParakeetTDTModel {
                 .map(|(idx, _)| idx)
                 .unwrap_or(blank_id);
 
+            // Compute softmax probability of the winning token for confidence scoring
+            let token_confidence = if token_id != blank_id {
+                let max_logit = vocab_logits
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = vocab_logits.iter().map(|&l| (l - max_logit).exp()).sum();
+                (vocab_logits[token_id] - max_logit).exp() / exp_sum
+            } else {
+                0.0
+            };
+
             let duration_step = if !duration_logits.is_empty() {
                 duration_logits
                     .iter()
@@ -273,6 +287,7 @@ impl ParakeetTDTModel {
                 tokens.push(token_id);
                 frame_indices.push(t);
                 durations.push(duration_step);
+                confidences.push(token_confidence);
                 last_emitted_token = token_id as i32;
                 emitted_tokens += 1;
             }
@@ -287,6 +302,6 @@ impl ParakeetTDTModel {
             }
         }
 
-        Ok((tokens, frame_indices, durations))
+        Ok((tokens, frame_indices, durations, confidences))
     }
 }

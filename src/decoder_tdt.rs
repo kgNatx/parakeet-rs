@@ -21,6 +21,7 @@ impl ParakeetTDTDecoder {
         tokens: &[usize],
         frame_indices: &[usize],
         _durations: &[usize],
+        confidences: &[f32],
         hop_length: usize,
         sample_rate: usize,
     ) -> Result<TranscriptionResult> {
@@ -68,10 +69,16 @@ impl ParakeetTDTDecoder {
                 {
                     full_text.push_str(&display_text);
 
+                    let conf = if i < confidences.len() {
+                        confidences[i]
+                    } else {
+                        0.0
+                    };
                     result_tokens.push(crate::decoder::TimedToken {
                         text: display_text,
                         start,
                         end,
+                        confidence: conf,
                     });
                 }
             }
@@ -101,7 +108,7 @@ mod tests {
         let vocab = make_vocab(&["▁like", "1", "0", "0"]);
         let decoder = ParakeetTDTDecoder::from_vocab(vocab);
         let result = decoder
-            .decode_with_timestamps(&[0, 1, 2, 3], &[0, 1, 2, 3], &[1, 1, 1, 1], 160, 16000)
+            .decode_with_timestamps(&[0, 1, 2, 3], &[0, 1, 2, 3], &[1, 1, 1, 1], &[0.9, 0.8, 0.7, 0.6], 160, 16000)
             .unwrap();
         assert_eq!(result.text, "like 100");
     }
@@ -112,7 +119,7 @@ mod tests {
         let vocab = make_vocab(&["▁a", "2", "4"]);
         let decoder = ParakeetTDTDecoder::from_vocab(vocab);
         let result = decoder
-            .decode_with_timestamps(&[0, 1, 2], &[0, 1, 2], &[1, 1, 1], 160, 16000)
+            .decode_with_timestamps(&[0, 1, 2], &[0, 1, 2], &[1, 1, 1], &[0.9, 0.8, 0.7], 160, 16000)
             .unwrap();
         assert_eq!(result.text, "a 24");
     }
@@ -123,7 +130,7 @@ mod tests {
         let vocab = make_vocab(&["▁A", "4"]);
         let decoder = ParakeetTDTDecoder::from_vocab(vocab);
         let result = decoder
-            .decode_with_timestamps(&[0, 1], &[0, 1], &[1, 1], 160, 16000)
+            .decode_with_timestamps(&[0, 1], &[0, 1], &[1, 1], &[0.9, 0.8], 160, 16000)
             .unwrap();
         assert_eq!(result.text, "A4");
     }
@@ -134,7 +141,7 @@ mod tests {
         let vocab = make_vocab(&["$", "1", "0", "0"]);
         let decoder = ParakeetTDTDecoder::from_vocab(vocab);
         let result = decoder
-            .decode_with_timestamps(&[0, 1, 2, 3], &[0, 1, 2, 3], &[1, 1, 1, 1], 160, 16000)
+            .decode_with_timestamps(&[0, 1, 2, 3], &[0, 1, 2, 3], &[1, 1, 1, 1], &[0.9, 0.8, 0.7, 0.6], 160, 16000)
             .unwrap();
         assert_eq!(result.text, "$100");
     }
@@ -149,6 +156,7 @@ mod tests {
                 &[0, 1, 2, 3, 4],
                 &[0, 1, 2, 3, 4],
                 &[1, 1, 1, 1, 1],
+                &[0.9, 0.8, 0.7, 0.6, 0.5],
                 160,
                 16000,
             )
@@ -162,7 +170,7 @@ mod tests {
         let vocab = make_vocab(&["▁like", "1", "0", "0"]);
         let decoder = ParakeetTDTDecoder::from_vocab(vocab);
         let result = decoder
-            .decode_with_timestamps(&[0, 1, 2, 3], &[0, 1, 2, 3], &[1, 1, 1, 1], 160, 16000)
+            .decode_with_timestamps(&[0, 1, 2, 3], &[0, 1, 2, 3], &[1, 1, 1, 1], &[0.9, 0.8, 0.7, 0.6], 160, 16000)
             .unwrap();
 
         // Check token texts - first digit should have space prepended
@@ -170,6 +178,19 @@ mod tests {
         assert_eq!(result.tokens[1].text, " 1"); // Space added by heuristic
         assert_eq!(result.tokens[2].text, "0");
         assert_eq!(result.tokens[3].text, "0");
+    }
+
+    #[test]
+    fn test_confidence_passthrough() {
+        // Verify confidence values are passed through from model to tokens
+        let vocab = make_vocab(&["▁hello", "▁world"]);
+        let decoder = ParakeetTDTDecoder::from_vocab(vocab);
+        let result = decoder
+            .decode_with_timestamps(&[0, 1], &[0, 1], &[1, 1], &[0.95, 0.42], 160, 16000)
+            .unwrap();
+        assert_eq!(result.tokens.len(), 2);
+        assert!((result.tokens[0].confidence - 0.95).abs() < 1e-6);
+        assert!((result.tokens[1].confidence - 0.42).abs() < 1e-6);
     }
 
     #[test]
@@ -183,6 +204,7 @@ mod tests {
                 &[0, 1, 2, 3, 4],
                 &[0, 1, 2, 3, 4],
                 &[1, 1, 1, 1, 1],
+                &[0.9, 0.8, 0.7, 0.6, 0.95],
                 160,
                 16000,
             )
