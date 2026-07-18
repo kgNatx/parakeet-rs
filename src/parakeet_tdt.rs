@@ -87,6 +87,43 @@ impl ParakeetTDT {
     pub fn preprocessor_config(&self) -> &PreprocessorConfig {
         &self.preprocessor_config
     }
+
+    /// Bias the decoder toward the given phrases (e.g. the user's dictionary).
+    /// Words are greedy-tokenized over the model's vocab pieces and stored as a
+    /// prefix trie. `strength` is the additive logit boost per on-path piece.
+    /// Empty `words` (or strength 0) disables biasing.
+    pub fn set_bias_phrases(&mut self, words: &[String], strength: f32) {
+        use std::collections::HashMap;
+        if words.is_empty() || strength == 0.0 {
+            self.model.set_bias(None, 0.0);
+            return;
+        }
+        // Build piece -> id map from the vocab, skipping special tokens
+        // (anything wrapped in <...> or <|...|>).
+        let vocab = self.decoder.vocab(); // from Step 1 (getter or direct field)
+        let mut piece_to_id: HashMap<String, u32> = HashMap::new();
+        for (id, piece) in vocab.id_to_token.iter().enumerate() {
+            if piece.is_empty() || piece.starts_with('<') {
+                continue;
+            }
+            piece_to_id.entry(piece.clone()).or_insert(id as u32);
+        }
+        // Register BOTH the as-typed and a lowercased tokenization of each word.
+        // v3 emits cased text but may lowercase a proper noun mid-sentence; without
+        // the lowercase path the trie would silently no-op and produce a FALSE
+        // NEGATIVE ("boosting doesn't work") that misjudges the whole approach.
+        let mut phrases: Vec<Vec<u32>> = Vec::new();
+        for w in words {
+            for variant in [w.clone(), w.to_lowercase()] {
+                let p = crate::biasing::greedy_tokenize(&variant, &piece_to_id);
+                if !p.is_empty() && !phrases.contains(&p) {
+                    phrases.push(p);
+                }
+            }
+        }
+        let trie = crate::biasing::BiasTrie::from_phrases(&phrases);
+        self.model.set_bias(Some(trie), strength);
+    }
 }
 
 impl Transcriber for ParakeetTDT {
