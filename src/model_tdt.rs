@@ -1,3 +1,4 @@
+use crate::biasing::BiasTrie;
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use ndarray::{Array1, Array2, Array3};
@@ -21,6 +22,8 @@ pub struct ParakeetTDTModel {
     encoder: Session,
     decoder_joint: Session,
     config: TDTModelConfig,
+    bias_trie: Option<BiasTrie>,
+    bias_strength: f32,
 }
 
 impl ParakeetTDTModel {
@@ -57,7 +60,15 @@ impl ParakeetTDTModel {
             encoder,
             decoder_joint,
             config,
+            bias_trie: None,
+            bias_strength: 0.0,
         })
+    }
+
+    /// Set (or clear with None) the contextual-biasing trie and its strength.
+    pub fn set_bias(&mut self, trie: Option<BiasTrie>, strength: f32) {
+        self.bias_trie = trie;
+        self.bias_strength = strength;
     }
     //file names simply from: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/tree/main
     fn find_encoder(dir: &Path) -> Result<PathBuf> {
@@ -199,6 +210,9 @@ impl ParakeetTDTModel {
         let mut emitted_tokens = 0;
         let mut last_emitted_token = blank_id as i32;
 
+        // Contextual-biasing active trie nodes (only used when bias_trie is set).
+        let mut bias_active: Vec<usize> = vec![crate::biasing::BiasTrie::ROOT];
+
         // Frame-by-frame RNN-T/TDT greedy decoding
         while t < time_steps {
             // Get single encoder frame: slice [0, :, t] and reshape to [1, encoder_dim, 1]
@@ -230,6 +244,22 @@ impl ParakeetTDTModel {
             let vocab_logits: Vec<f32> = logits_data.iter().take(vocab_size).copied().collect();
             let duration_logits: Vec<f32> = logits_data.iter().skip(vocab_size).copied().collect();
 
+            // Snapshot UNBIASED logits — the confidence softmax below must use
+            // these, so boosting never inflates a token's reported confidence.
+            let unbiased_logits = vocab_logits.clone();
+            // Contextual biasing: boost pieces that continue an active dictionary
+            // -word path. Zero-cost when no trie is set.
+            let mut vocab_logits = vocab_logits; // shadow to make mutable
+            if let Some(trie) = &self.bias_trie {
+                for &node in &bias_active {
+                    for (&tok, _) in trie.children_of(node) {
+                        if (tok as usize) < vocab_logits.len() {
+                            vocab_logits[tok as usize] += self.bias_strength;
+                        }
+                    }
+                }
+            }
+
             let token_id = vocab_logits
                 .iter()
                 .enumerate()
@@ -239,12 +269,12 @@ impl ParakeetTDTModel {
 
             // Compute softmax probability of the winning token for confidence scoring
             let token_confidence = if token_id != blank_id {
-                let max_logit = vocab_logits
+                let max_logit = unbiased_logits
                     .iter()
                     .cloned()
                     .fold(f32::NEG_INFINITY, f32::max);
-                let exp_sum: f32 = vocab_logits.iter().map(|&l| (l - max_logit).exp()).sum();
-                (vocab_logits[token_id] - max_logit).exp() / exp_sum
+                let exp_sum: f32 = unbiased_logits.iter().map(|&l| (l - max_logit).exp()).sum();
+                (unbiased_logits[token_id] - max_logit).exp() / exp_sum
             } else {
                 0.0
             };
@@ -289,6 +319,9 @@ impl ParakeetTDTModel {
                 durations.push(duration_step);
                 confidences.push(token_confidence);
                 last_emitted_token = token_id as i32;
+                if let Some(trie) = &self.bias_trie {
+                    bias_active = trie.advance(&bias_active, token_id as u32);
+                }
                 emitted_tokens += 1;
             }
             // When duration > 0, skip frames according to duration prediction
