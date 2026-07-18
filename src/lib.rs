@@ -44,6 +44,7 @@
 //! - Bit Depth: 16-bit PCM or 32-bit float
 
 mod audio;
+pub mod biasing;
 mod config;
 mod decoder;
 mod decoder_tdt;
