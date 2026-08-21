@@ -52,7 +52,7 @@ mod execution;
 mod model;
 mod model_eou;
 mod model_nemotron;
-mod model_tdt;
+pub mod model_tdt;
 mod model_unified;
 mod nemotron;
 mod parakeet;
@@ -85,6 +85,7 @@ pub use config::{ModelConfig as ModelConfigJson, PreprocessorConfig};
 
 pub use decoder::{ParakeetDecoder, TimedToken, TranscriptionResult};
 pub use model::ParakeetModel;
+pub use model_tdt::{EncoderStates, ParakeetTDTModel};
 pub use model_eou::ParakeetEOUModel;
 pub use model_nemotron::{NemotronEncoderCache, NemotronModel, NemotronModelConfig};
 pub use model_unified::{ParakeetUnifiedModel, UnifiedModelConfig};

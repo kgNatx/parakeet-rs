@@ -4,7 +4,7 @@ use crate::decoder::TranscriptionResult;
 use crate::decoder_tdt::ParakeetTDTDecoder;
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
-use crate::model_tdt::ParakeetTDTModel;
+use crate::model_tdt::{EncoderStates, ParakeetTDTModel};
 use crate::timestamps::{process_timestamps, TimestampMode};
 use crate::transcriber::Transcriber;
 use crate::vocab::Vocabulary;
@@ -89,14 +89,39 @@ impl ParakeetTDT {
     }
 }
 
-impl Transcriber for ParakeetTDT {
-    fn transcribe_samples(
+impl ParakeetTDT {
+    /// Transcribe, and also return the encoder hidden states the decoder ran on.
+    ///
+    /// Identical to [`Transcriber::transcribe_samples`] in every observable way except that it
+    /// hands back [`EncoderStates`] alongside the transcript. The encoder pass happens either way;
+    /// this just stops throwing the result away. Intended for acoustic matching, where the encoder
+    /// representation is a far better identity feature than raw MFCCs.
+    ///
+    /// The transcript's word timestamps and the encoder time axis share one clock, so a word
+    /// spanning `[start, end)` seconds maps to encoder frames
+    /// `[start / spf, end / spf)` where `spf` is [`EncoderStates::seconds_per_frame`].
+    pub fn transcribe_samples_with_encoder(
         &mut self,
         audio: Vec<f32>,
         sample_rate: u32,
         channels: u16,
         mode: Option<TimestampMode>,
-    ) -> Result<TranscriptionResult> {
+    ) -> Result<(TranscriptionResult, EncoderStates)> {
+        let (result, states) = self.run(audio, sample_rate, channels, mode, true)?;
+        // `want_encoder = true` always populates it.
+        Ok((result, states.expect("encoder states requested")))
+    }
+
+    /// Shared body of the transcribe paths. `want_encoder` decides only whether the encoder
+    /// output is copied out; the decode is bit-identical either way.
+    fn run(
+        &mut self,
+        audio: Vec<f32>,
+        sample_rate: u32,
+        channels: u16,
+        mode: Option<TimestampMode>,
+        want_encoder: bool,
+    ) -> Result<(TranscriptionResult, Option<EncoderStates>)> {
         // Keep upstream's cached feature extraction (v0.3.6 perf win) AND our
         // confidence return value from forward().
         let features = audio::extract_features_with_cache(
@@ -106,7 +131,18 @@ impl Transcriber for ParakeetTDT {
             &self.preprocessor_config,
             &self.feature_cache,
         )?;
-        let (tokens, frame_indices, durations, confidences) = self.model.forward(features)?;
+        let (tokens, frame_indices, durations, confidences, encoder) = if want_encoder {
+            let (t, f, d, c, enc) = self.model.forward_with_encoder(features)?;
+            let states = EncoderStates::from_encoder_out(
+                &enc,
+                self.preprocessor_config.hop_length,
+                self.preprocessor_config.sampling_rate,
+            );
+            (t, f, d, c, Some(states))
+        } else {
+            let (t, f, d, c) = self.model.forward(features)?;
+            (t, f, d, c, None)
+        };
 
         let mut result = self.decoder.decode_with_timestamps(
             &tokens,
@@ -152,6 +188,19 @@ impl Transcriber for ParakeetTDT {
                 .join(" ")
         };
 
+        Ok((result, encoder))
+    }
+}
+
+impl Transcriber for ParakeetTDT {
+    fn transcribe_samples(
+        &mut self,
+        audio: Vec<f32>,
+        sample_rate: u32,
+        channels: u16,
+        mode: Option<TimestampMode>,
+    ) -> Result<TranscriptionResult> {
+        let (result, _) = self.run(audio, sample_rate, channels, mode, false)?;
         Ok(result)
     }
 }

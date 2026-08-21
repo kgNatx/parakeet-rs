@@ -23,6 +23,67 @@ pub struct ParakeetTDTModel {
     config: TDTModelConfig,
 }
 
+/// Encoder hidden states for one utterance, time-major.
+///
+/// The FastConformer encoder subsamples 8x, so each entry of `frames` covers
+/// `8 * hop_length / sample_rate` seconds — 80 ms at the TDT defaults. That is coarse next to the
+/// 10 ms MFCC hop it replaces: a 600 ms word is about 7 frames. In exchange each frame is a
+/// ~1024-dim representation the model learned for distinguishing what was said, rather than 13
+/// cepstral coefficients that also encode who said it and on what microphone.
+#[derive(Debug, Clone)]
+pub struct EncoderStates {
+    /// Encoder width (`frames[t].len()` for every `t`).
+    pub dim: usize,
+    /// Time-major frames: `frames[t][d]`.
+    pub frames: Vec<Vec<f32>>,
+    /// Feature-extractor hop, in samples, before encoder subsampling.
+    pub hop_length: usize,
+    /// Sample rate the hop is measured against.
+    pub sample_rate: usize,
+}
+
+impl EncoderStates {
+    /// Encoder subsampling factor. Matches the stride `ParakeetTDTDecoder` uses to turn
+    /// `frame_indices` into timestamps; the two must agree or timestamps and frames desynchronize.
+    pub const ENCODER_STRIDE: usize = 8;
+
+    /// Seconds covered by one encoder frame.
+    pub fn seconds_per_frame(&self) -> f64 {
+        (Self::ENCODER_STRIDE * self.hop_length) as f64 / self.sample_rate as f64
+    }
+
+    /// Frames overlapping `[start, end)` seconds, clamped to what the encoder actually produced.
+    ///
+    /// Returns an empty slice when the range is empty or lies past the end. A range shorter than
+    /// one frame still yields the single frame containing `start`, so a very short word is never
+    /// silently dropped.
+    pub fn slice_seconds(&self, start: f64, end: f64) -> &[Vec<f32>] {
+        let spf = self.seconds_per_frame();
+        let n = self.frames.len();
+        if n == 0 || end <= start {
+            return &[];
+        }
+        let lo = ((start / spf).floor().max(0.0) as usize).min(n.saturating_sub(1));
+        let hi = ((end / spf).ceil() as usize).clamp(lo + 1, n);
+        &self.frames[lo..hi]
+    }
+
+    /// Transpose ONNX `[batch, encoder_dim, time]` into time-major frames.
+    pub(crate) fn from_encoder_out(
+        encoder_out: &Array3<f32>,
+        hop_length: usize,
+        sample_rate: usize,
+    ) -> Self {
+        let dim = encoder_out.shape()[1];
+        let time_steps = encoder_out.shape()[2];
+        let mut frames = Vec::with_capacity(time_steps);
+        for t in 0..time_steps {
+            frames.push(encoder_out.slice(ndarray::s![0, .., t]).to_vec());
+        }
+        Self { dim, frames, hop_length, sample_rate }
+    }
+}
+
 impl ParakeetTDTModel {
     /// Load TDT model from directory containing encoder and decoder_joint ONNX files
     ///
@@ -121,6 +182,29 @@ impl ParakeetTDTModel {
             self.greedy_decode(&encoder_out, encoder_len)?;
 
         Ok((tokens, frame_indices, durations, confidences))
+    }
+
+    /// Like [`forward`](Self::forward), but also hands back the encoder hidden states that
+    /// greedy decoding just consumed.
+    ///
+    /// `run_encoder` already computes these on every utterance and `forward` drops them on the
+    /// floor. Returning them costs one move, no extra inference. Callers doing acoustic matching
+    /// want the encoder representation rather than raw filterbank features, because the encoder is
+    /// trained to discard speaker, channel and prosody while keeping phonetic identity.
+    ///
+    /// The returned array is `[batch, encoder_dim, time]` — the same layout `greedy_decode`
+    /// indexes, so `frame_indices` line up with its time axis directly. Note the encoder subsamples
+    /// 8x, so one time step is `8 * hop_length / sample_rate` seconds (80 ms at the TDT defaults).
+    pub fn forward_with_encoder(
+        &mut self,
+        features: Array2<f32>,
+    ) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<f32>, Array3<f32>)> {
+        let (encoder_out, encoder_len) = self.run_encoder(&features)?;
+
+        let (tokens, frame_indices, durations, confidences) =
+            self.greedy_decode(&encoder_out, encoder_len)?;
+
+        Ok((tokens, frame_indices, durations, confidences, encoder_out))
     }
 
     fn run_encoder(&mut self, features: &Array2<f32>) -> Result<(Array3<f32>, i64)> {
