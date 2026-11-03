@@ -58,23 +58,18 @@ pub(crate) fn group_by_words(tokens: &[TimedToken]) -> Vec<TimedToken> {
     let mut current_word_text = String::new();
     let mut current_word_start = 0.0;
     let mut current_word_min_confidence = 1.0f32;
-    let mut last_word_lower = String::new();
 
     for (i, token) in tokens.iter().enumerate() {
         // Space-only tokens (from SentencePiece ▁ word boundaries) act as word separators
         // but don't contribute text. Save current word if we hit one.
         if token.text.trim().is_empty() {
             if !current_word_text.is_empty() {
-                let word_lower = current_word_text.to_lowercase();
-                if word_lower != last_word_lower {
-                    words.push(TimedToken {
-                        text: current_word_text.clone(),
-                        start: current_word_start,
-                        end: if i > 0 { tokens[i - 1].end } else { token.end },
-                        confidence: current_word_min_confidence,
-                    });
-                    last_word_lower = word_lower;
-                }
+                words.push(TimedToken {
+                    text: current_word_text.clone(),
+                    start: current_word_start,
+                    end: if i > 0 { tokens[i - 1].end } else { token.end },
+                    confidence: current_word_min_confidence,
+                });
                 current_word_text.clear();
                 current_word_min_confidence = 1.0;
             }
@@ -100,17 +95,14 @@ pub(crate) fn group_by_words(tokens: &[TimedToken]) -> Vec<TimedToken> {
                 || i == 0;
 
         if starts_word && !current_word_text.is_empty() {
-            // Save previous word (with deduplication)
-            let word_lower = current_word_text.to_lowercase();
-            if word_lower != last_word_lower {
-                words.push(TimedToken {
-                    text: current_word_text.clone(),
-                    start: current_word_start,
-                    end: tokens[i - 1].end,
-                    confidence: current_word_min_confidence,
-                });
-                last_word_lower = word_lower;
-            }
+            // Save previous word. Every word is kept, repeats included: a repeated word is
+            // what the speaker said ("blah blah blah", "two two two").
+            words.push(TimedToken {
+                text: current_word_text.clone(),
+                start: current_word_start,
+                end: tokens[i - 1].end,
+                confidence: current_word_min_confidence,
+            });
             current_word_text.clear();
             current_word_min_confidence = 1.0;
         }
@@ -130,15 +122,12 @@ pub(crate) fn group_by_words(tokens: &[TimedToken]) -> Vec<TimedToken> {
 
     // Add final word
     if !current_word_text.is_empty() {
-        let word_lower = current_word_text.to_lowercase();
-        if word_lower != last_word_lower {
-            words.push(TimedToken {
-                text: current_word_text,
-                start: current_word_start,
-                end: tokens.last().unwrap().end,
-                confidence: current_word_min_confidence,
-            });
-        }
+        words.push(TimedToken {
+            text: current_word_text,
+            start: current_word_start,
+            end: tokens.last().unwrap().end,
+            confidence: current_word_min_confidence,
+        });
     }
 
     words
@@ -349,6 +338,42 @@ mod tests {
 
         let result = format_sentence(&words);
         assert_eq!(result, "uh uh hello");
+    }
+
+    fn timed(texts: &[&str]) -> Vec<TimedToken> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TimedToken {
+                text: t.to_string(),
+                start: i as f32,
+                end: i as f32 + 1.0,
+                confidence: 1.0,
+            })
+            .collect()
+    }
+
+    fn word_texts(tokens: &[TimedToken]) -> Vec<String> {
+        group_by_words(tokens).into_iter().map(|w| w.text).collect()
+    }
+
+    /// A word the speaker repeated is what they said: word grouping must keep every one
+    /// ("blah blah blah", "no no no", a phone number's "two two two"). Upstream removed the
+    /// same dedup in altunenes/parakeet-rs f8d7167 (2026-09-23).
+    #[test]
+    fn test_word_grouping_keeps_repeated_words() {
+        assert_eq!(
+            word_texts(&timed(&["▁blah", "▁blah", "▁blah", "."])),
+            ["blah", "blah", "blah", "."]
+        );
+        assert_eq!(
+            word_texts(&timed(&["▁five", "▁one", "▁two", "▁two", "▁two", "▁two", "▁four"])),
+            ["five", "one", "two", "two", "two", "two", "four"]
+        );
+        // Case-insensitive repeats too, and a repeat closing the utterance (the final-word path).
+        assert_eq!(word_texts(&timed(&["▁No", "▁no"])), ["No", "no"]);
+        // A repeat separated by a space-only token (the separator path).
+        assert_eq!(word_texts(&timed(&["▁very", " ", "▁very", "▁good"])), ["very", "very", "good"]);
     }
 
     #[test]
