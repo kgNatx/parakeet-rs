@@ -170,9 +170,9 @@ impl PhraseBooster {
         }
     }
 
-    /// Compile `phrases` for `vocab`, spelled by the `tokenizer.json` at `tokenizer`. The ONE
-    /// place the blank id is defined: the decode loop's blank is `vocab_size - 1`, and the
-    /// model's `vocab_size` is `vocab.size()`. An empty `phrases` never reads `tokenizer`, so
+    /// Compile `phrases` for `vocab`, spelled by the `tokenizer.json` at `tokenizer`. The blank id
+    /// is the decode loop's own ([`crate::model_tdt::tdt_blank_id`]), of the model's `vocab_size`,
+    /// which is `vocab.size()`. An empty `phrases` never reads `tokenizer`, so
     /// "no custom words" needs no tokenizer file; its booster still runs the real cursor.
     pub(crate) fn from_vocabulary(
         vocab: &Vocabulary,
@@ -180,7 +180,7 @@ impl PhraseBooster {
         phrases: &[String],
         strength: f32,
     ) -> Result<PhraseBooster> {
-        let blank_id = vocab.size().saturating_sub(1);
+        let blank_id = crate::model_tdt::tdt_blank_id(vocab.size());
         if phrases.is_empty() {
             return Ok(Self::compile(&vocab.id_to_token, blank_id, None, phrases, strength));
         }

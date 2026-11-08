@@ -327,6 +327,12 @@ fn token_confidence(vocab_logits: &[f32], token_id: usize, blank_id: usize) -> f
     }
 }
 
+/// The TDT blank token's id: the last of the `vocab_size` token logits. The ONE definition, shared
+/// by the decode walk and the phrase booster (which must never bias toward blank).
+pub(crate) fn tdt_blank_id(vocab_size: usize) -> usize {
+    vocab_size.saturating_sub(1)
+}
+
 /// Frame-by-frame TDT greedy decoding over `time_steps` encoder frames.
 ///
 /// Knows the walk: the token and duration argmaxes, that a duration > 0 jumps that many frames,
@@ -343,7 +349,7 @@ pub(crate) fn decode_steps(
     booster: Option<&PhraseBooster>,
 ) -> Result<Decoded> {
     let max_tokens_per_step = 10;
-    let blank_id = vocab_size - 1;
+    let blank_id = tdt_blank_id(vocab_size);
 
     let mut tokens = Vec::new();
     let mut frame_indices = Vec::new();
@@ -514,6 +520,11 @@ mod decode_tests {
     const VOCAB: usize = 4;
     const BLANK: usize = 3;
     const N_DUR: usize = 5;
+
+    #[test]
+    fn the_blank_is_the_last_token() {
+        assert_eq!(tdt_blank_id(VOCAB), BLANK);
+    }
 
     /// Logits whose token argmax is `tok` and duration argmax is `dur`.
     fn step(tok: usize, dur: usize) -> Vec<f32> {
