@@ -9,7 +9,8 @@ mod tree;
 use crate::error::Error;
 use crate::model_tdt::argmax_last;
 use spell::Speller;
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use tree::{NodeId, Tree, ROOT};
 
 /// Why a phrase was left out of the boost list. Never fatal: the caller logs it.
@@ -50,8 +51,8 @@ const BETA: f32 = 2.0;
 ///
 /// Built once (about a millisecond), immutable, and shared by every decode
 /// that should be boosted; each decode walks it with its own `cursor()`.
-/// Phrases are deduplicated case-insensitively (the first casing is kept;
-/// the spellings already cover the case variants). A phrase that cannot be
+/// Phrases are deduplicated case-insensitively: one entry, named by the
+/// first casing, carrying the spellings of every casing given. A phrase that cannot be
 /// boosted is kept in `skipped()` with its reason, never silently lost.
 pub struct PhraseBooster {
     phrases: Vec<String>,
@@ -78,36 +79,54 @@ impl PhraseBooster {
         strength: f32,
     ) -> PhraseBooster {
         let speller = Speller::new(id_to_token, blank_id);
-        let mut seen: HashSet<String> = HashSet::new();
+        // One entry per case-insensitive key, named by its first casing; every
+        // casing given contributes its spellings (an as-written variant can
+        // reach pieces the others cannot).
+        let mut groups: Vec<(&String, Vec<&String>)> = Vec::new();
+        let mut group_of: HashMap<String, usize> = HashMap::new();
+        for phrase in phrases {
+            match group_of.entry(dedup_key(phrase)) {
+                Entry::Occupied(e) => groups[*e.get()].1.push(phrase),
+                Entry::Vacant(e) => {
+                    e.insert(groups.len());
+                    groups.push((phrase, vec![phrase]));
+                }
+            }
+        }
         let mut kept = Vec::new();
         let mut spellings = Vec::new();
         let mut skipped = Vec::new();
         let mut seqs: Vec<(Vec<u32>, u32)> = Vec::new();
-        for phrase in phrases {
-            if !seen.insert(dedup_key(phrase)) {
-                continue;
-            }
-            let spelled = speller
-                .spell(phrase)
-                .map(|ss| ss.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>());
-            match spelled {
-                Err(reason) => skipped.push((phrase.clone(), reason)),
-                Ok(ss) if ss.is_empty() => skipped.push((phrase.clone(), SkipReason::NotSpellable)),
-                Ok(ss) => {
-                    let index = kept.len() as u32;
-                    spellings.push(
-                        ss.iter()
-                            .map(|s| {
-                                s.iter()
-                                    .map(|&id| id_to_token[id as usize].clone())
-                                    .collect()
-                            })
-                            .collect(),
-                    );
-                    seqs.extend(ss.into_iter().map(|s| (s, index)));
-                    kept.push(phrase.clone());
+        for (phrase, casings) in groups {
+            let mut ss: Vec<Vec<u32>> = Vec::new();
+            let mut first_err = None;
+            for casing in casings {
+                match speller.spell(casing) {
+                    Ok(found) => ss.extend(found.into_iter().filter(|s| !s.is_empty())),
+                    Err(reason) => {
+                        first_err.get_or_insert(reason);
+                    }
                 }
             }
+            ss.sort();
+            ss.dedup();
+            if ss.is_empty() {
+                let reason = first_err.unwrap_or(SkipReason::NotSpellable);
+                skipped.push((phrase.clone(), reason));
+                continue;
+            }
+            let index = kept.len() as u32;
+            spellings.push(
+                ss.iter()
+                    .map(|s| {
+                        s.iter()
+                            .map(|&id| id_to_token[id as usize].clone())
+                            .collect()
+                    })
+                    .collect(),
+            );
+            seqs.extend(ss.into_iter().map(|s| (s, index)));
+            kept.push(phrase.clone());
         }
         let strength = if strength.is_nan() {
             0.0
@@ -253,6 +272,11 @@ impl BoostCursor<'_> {
         }
         let alpha = b.strength;
         let bonus = b.tree.step_bonus(self.state);
+        // Identity by construction, not by arithmetic: with a NaN in the
+        // logits, `unbiased` need not be the largest finite logit.
+        if alpha == 0.0 || bonus.is_empty() {
+            return unbiased;
+        }
         let own = bonus
             .iter()
             .find(|&&(tok, _)| tok as usize == unbiased)
@@ -280,6 +304,7 @@ impl BoostCursor<'_> {
     /// changed it, the new tree state, and a hit when a phrase completes here,
     /// spanning the last `depth` emitted tokens.
     pub(crate) fn emitted(&mut self, token: usize) {
+        debug_assert_ne!(token, self.booster.blank_id, "blank is never emitted");
         self.changed.push(std::mem::take(&mut self.last_changed));
         self.state = self.booster.tree.advance(self.state, token as u32);
         if let Some((phrase, depth)) = self.booster.tree.completed(self.state) {
@@ -416,6 +441,9 @@ mod tests {
         cases.push(logits(&[(CA, 2.0), (OFF, 2.0)]));
         cases.push(logits(&[(OFF, 2.0), (CAP_CA, 2.0)]));
         cases.push(logits(&[(IRN, 2.0), (OFF, 2.0)]));
+        // a NaN makes argmax_last return a non-maximal later index; strength 0
+        // must still follow it rather than re-rank against a boosted token
+        cases.push(logits(&[(CA, 1.0), (2, f32::NAN), (OFF, 0.5)]));
         for l in &cases {
             let want = argmax_last(l).unwrap_or(blank);
             assert_eq!(c.pick(l), want, "{l:?}");
@@ -496,6 +524,46 @@ mod tests {
             vec![vec!["▁dog".to_string(), "s".to_string()]]
         );
         assert!(b.spellings("unknown").is_empty());
+    }
+
+    #[test]
+    fn case_duplicates_keep_every_variants_spellings() {
+        let v: Vec<String> = ["<unk>", "▁dock", "box", "▁Dock", "Box", "<blk>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let blank = v.len() - 1;
+        let p = |s: &str| s.to_string();
+        let b = PhraseBooster::new(&v, blank, &[p("dockbox"), p("DockBox")], 1.0);
+        assert_eq!(b.phrases(), &[p("dockbox")]);
+        // `▁Dock Box` is only reachable through the second casing
+        let want = vec![
+            vec![p("▁dock"), p("box")],
+            vec![p("▁Dock"), p("box")],
+            vec![p("▁Dock"), p("Box")],
+        ];
+        assert_eq!(b.spellings("dockbox"), want);
+        assert_eq!(b.spellings("DOCKBOX"), want);
+        let mut c = b.cursor();
+        c.emitted(3);
+        c.emitted(4);
+        assert_eq!(
+            c.finish().hits,
+            vec![RawHit {
+                phrase: 0,
+                first: 0,
+                last: 1
+            }]
+        );
+        // a later casing the vocab can spell rescues a first casing it cannot
+        let caps: Vec<String> = ["<unk>", "▁Dock", "Box", "<blk>"]
+            .iter()
+            .map(|s| p(s))
+            .collect();
+        let b = PhraseBooster::new(&caps, 3, &[p("dockbox"), p("DockBox")], 1.0);
+        assert_eq!(b.phrases(), &[p("dockbox")]);
+        assert!(b.skipped().is_empty());
+        assert_eq!(b.spellings("dockbox"), vec![vec![p("▁Dock"), p("Box")]]);
     }
 
     #[test]
