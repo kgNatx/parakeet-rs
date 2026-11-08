@@ -21,12 +21,19 @@ pub(crate) fn load_tokenizer(path: &Path) -> Result<Tokenizer> {
 /// Letters are alphanumeric characters; `TooShort` when there are ≤ 2 of them
 /// (so a whitespace-only phrase is always `TooShort`). A variant whose encoding
 /// is empty or holds the blank or any `<…>` piece (`<unk>`, byte fallback, a
-/// control token) is no spelling; `NotSpellable` when no variant spells.
+/// control token), or whose first piece does not start a word (`▁…`), is no
+/// spelling; `NotSpellable` when no variant spells. A phrase holding any digit
+/// (`char::is_numeric`) is `NotSpellable` before encoding: the published
+/// tokenizer splits digits out first and loses or misplaces the word boundary
+/// around them (`Windows 11` → `…|s|1|1`, `7zip` → `7|▁z|ip`), which is not how
+/// the model's SentencePiece tokenizer spelled its training text.
 /// Whitespace is trimmed and runs collapse to one space before encoding.
 pub(crate) struct Speller {
     tokenizer: Tokenizer,
     /// Per token id: may this piece appear in a spelling?
     usable: Vec<bool>,
+    /// Per token id: does this piece start a word (`▁…`)?
+    word_start: Vec<bool>,
 }
 
 impl Speller {
@@ -69,7 +76,8 @@ impl Speller {
                 id != blank_id && !tok.is_empty() && !special
             })
             .collect();
-        Ok(Speller { tokenizer, usable })
+        let word_start = id_to_token.iter().map(|t| t.starts_with('▁')).collect();
+        Ok(Speller { tokenizer, usable, word_start })
     }
 
     pub(crate) fn spell(&self, phrase: &str) -> std::result::Result<Vec<Vec<u32>>, SkipReason> {
@@ -81,6 +89,9 @@ impl Speller {
             .count();
         if letters < MIN_LETTERS {
             return Err(SkipReason::TooShort);
+        }
+        if words.iter().flat_map(|w| w.chars()).any(char::is_numeric) {
+            return Err(SkipReason::NotSpellable);
         }
         let joined = words.join(" ");
 
@@ -105,11 +116,12 @@ impl Speller {
         }
     }
 
-    /// The canonical encoding of `text`, if every piece of it is usable.
+    /// The canonical encoding of `text`, if it starts a word and every piece of it is usable.
     fn encode(&self, text: &str) -> Option<Vec<u32>> {
         let ids = self.tokenizer.encode(text, false).ok()?.get_ids().to_vec();
-        let usable = |&id: &u32| self.usable.get(id as usize).copied().unwrap_or(false);
-        (!ids.is_empty() && ids.iter().all(usable)).then_some(ids)
+        let is = |mask: &[bool], id: u32| mask.get(id as usize).copied().unwrap_or(false);
+        let starts_word = ids.first().is_some_and(|&id| is(&self.word_start, id));
+        (starts_word && ids.iter().all(|&id| is(&self.usable, id))).then_some(ids)
     }
 }
 
@@ -214,6 +226,8 @@ mod tests {
             ("Covalex", "▁C|ov|ale|x"),
             ("dockbox-prod", "▁do|ck|bo|x|-|pro|d"),
             (".claude", "▁|.|c|la|ude"),
+            ("claude.md", "▁c|la|ude|.|m|d"),
+            ("parakeet-rs", "▁par|ake|et|-|rs"),
         ] {
             let got = as_pieces(&v, &sp.spell(phrase).unwrap());
             assert!(got.iter().any(|s| s == want), "{phrase}: {got:?}");
@@ -227,8 +241,7 @@ mod tests {
         let got = as_pieces(&v, &sp.spell("Covalex").unwrap());
         assert_eq!(got.len(), 2, "{got:?}");
         assert!(got.contains(&"▁C|ov|ale|x".to_string()), "{got:?}");
-        // All three variants coincide for a lowercase word whose first-upper form
-        // encodes differently; never more than three spellings.
+        // Three case variants give at most three spellings, never a duplicate.
         for p in ["belly", "BELLY", "Belly", "dockbox-prod", "New York"] {
             let got = sp.spell(p).unwrap();
             assert!((1..=3).contains(&got.len()), "{p}: {got:?}");
@@ -245,6 +258,37 @@ mod tests {
         let Some((_, _, sp)) = real() else { return };
         for p in ["abc🙂", "東京都", "<unk>", "<|endoftext|>"] {
             assert_eq!(sp.spell(p), Err(SkipReason::NotSpellable), "{p}");
+        }
+    }
+
+    /// HF's conversion of the tokenizer splits digits out before BPE and loses or
+    /// misplaces the word boundary around them (`Windows 11` → `…|s|1|1`, `7zip` →
+    /// `7|▁z|ip`), unlike the model's SentencePiece: any phrase with a digit fails closed.
+    #[test]
+    fn a_phrase_with_a_digit_is_not_spellable() {
+        let Some((_, _, sp)) = real() else { return };
+        for p in ["Windows 11", "v2beta", "7zip", "GPT-4o", "x²yz"] {
+            assert_eq!(sp.spell(p), Err(SkipReason::NotSpellable), "{p}");
+        }
+        assert!(sp.spell("Windows").is_ok());
+        assert!(sp.spell("GPT-four").is_ok());
+        // The fixture tokenizer agrees: the rule is the speller's, not the file's.
+        let (v, b) = small();
+        assert_eq!(speller(&v, b).spell("Cairn2"), Err(SkipReason::NotSpellable));
+        assert!(speller(&v, b).spell("Cairn").is_ok());
+    }
+
+    #[test]
+    fn every_real_spelling_starts_at_a_word_start() {
+        let Some((v, _, sp)) = real() else { return };
+        for p in [
+            ".claude", "dockbox-prod", "New York", "claude.md", "parakeet-rs", "Covalex",
+            "belly", "-prod", "'tis", "(paren)", "C++", "e.g. this",
+        ] {
+            let Ok(got) = sp.spell(p) else { continue };
+            for s in &got {
+                assert!(v[s[0] as usize].starts_with('▁'), "{p}: {:?}", as_pieces(&v, &got));
+            }
         }
     }
 

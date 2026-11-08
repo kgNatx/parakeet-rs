@@ -90,6 +90,19 @@ impl PhraseBooster {
         strength: f32,
     ) -> Result<PhraseBooster> {
         let speller = Speller::new(tokenizer, id_to_token, blank_id)?;
+        Ok(Self::compile(id_to_token, blank_id, Some(&speller), phrases, strength))
+    }
+
+    /// `new` once the speller is built; `speller` is `None` only for an empty
+    /// `phrases`, which never needs spelling.
+    fn compile(
+        id_to_token: &[String],
+        blank_id: usize,
+        speller: Option<&Speller>,
+        phrases: &[String],
+        strength: f32,
+    ) -> PhraseBooster {
+        debug_assert!(speller.is_some() || phrases.is_empty());
         // One entry per case-insensitive key, named by its first casing; every
         // casing given contributes its spellings (an as-written variant can
         // reach pieces the others cannot).
@@ -112,7 +125,7 @@ impl PhraseBooster {
             let mut ss: Vec<Vec<u32>> = Vec::new();
             let mut first_err = None;
             for casing in casings {
-                match speller.spell(casing) {
+                match speller.map_or(Err(SkipReason::NotSpellable), |s| s.spell(casing)) {
                     Ok(found) => ss.extend(found.into_iter().filter(|s| !s.is_empty())),
                     Err(reason) => {
                         first_err.get_or_insert(reason);
@@ -144,7 +157,7 @@ impl PhraseBooster {
         } else {
             strength.clamp(0.0, Self::MAX_STRENGTH)
         };
-        Ok(PhraseBooster {
+        PhraseBooster {
             phrases: kept,
             spellings,
             skipped,
@@ -154,12 +167,13 @@ impl PhraseBooster {
             vocab_len: id_to_token.len(),
             vocab_fingerprint: fingerprint(id_to_token),
             pieces: id_to_token.to_vec(),
-        })
+        }
     }
 
     /// Compile `phrases` for `vocab`, spelled by the `tokenizer.json` at `tokenizer`. The ONE
     /// place the blank id is defined: the decode loop's blank is `vocab_size - 1`, and the
-    /// model's `vocab_size` is `vocab.size()`.
+    /// model's `vocab_size` is `vocab.size()`. An empty `phrases` never reads `tokenizer`, so
+    /// "no custom words" needs no tokenizer file; its booster still runs the real cursor.
     pub(crate) fn from_vocabulary(
         vocab: &Vocabulary,
         tokenizer: &Path,
@@ -167,6 +181,9 @@ impl PhraseBooster {
         strength: f32,
     ) -> Result<PhraseBooster> {
         let blank_id = vocab.size().saturating_sub(1);
+        if phrases.is_empty() {
+            return Ok(Self::compile(&vocab.id_to_token, blank_id, None, phrases, strength));
+        }
         let tokenizer = spell::load_tokenizer(tokenizer)?;
         PhraseBooster::new(&vocab.id_to_token, blank_id, tokenizer, phrases, strength)
     }
@@ -429,6 +446,32 @@ mod tests {
         assert!(from_file.check_vocab(&v).is_ok());
         assert!(PhraseBooster::from_files(&dir.join("missing.txt"), &tok_path, &p, 2.0).is_err());
         assert!(PhraseBooster::from_files(&path, &dir.join("missing.json"), &p, 2.0).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_phrases_need_no_tokenizer_file() {
+        let dir = std::env::temp_dir().join(format!("pb-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vocab.txt");
+        let (v, blank) = vocab();
+        let text: String = v.iter().enumerate().map(|(i, t)| format!("{t} {i}
+")).collect();
+        std::fs::write(&path, text).unwrap();
+        let b = PhraseBooster::from_files(&path, &dir.join("no-such-tokenizer.json"), &[], 2.0)
+            .unwrap();
+        assert!(b.is_empty());
+        assert_eq!(b.blank_id, blank);
+        assert!(b.check_vocab(&v).is_ok());
+        // Its cursor is the real one: plain argmax, a trace per emitted token.
+        let mut c = b.cursor();
+        assert_eq!(c.pick(&logits(&[(OFF, 1.0)])), OFF);
+        c.emitted(OFF);
+        assert_eq!(c.finish().changed, vec![false]);
+        // A non-empty list still needs the file.
+        let p = phrases(&["cairn"]);
+        assert!(PhraseBooster::from_files(&path, &dir.join("no-such-tokenizer.json"), &p, 2.0)
+            .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
