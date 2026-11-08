@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
+use crate::phrase_boost::{BoostTrace, PhraseBooster};
 use ndarray::{Array1, Array2, Array3};
 use ort::session::Session;
 use std::path::{Path, PathBuf};
@@ -43,8 +44,8 @@ pub struct EncoderStates {
 }
 
 impl EncoderStates {
-    /// Encoder subsampling factor. Matches the stride `ParakeetTDTDecoder` uses to turn
-    /// `frame_indices` into timestamps; the two must agree or timestamps and frames desynchronize.
+    /// Encoder subsampling factor. `decoder_tdt::token_start_seconds` turns `frame_indices` into
+    /// timestamps with this same constant, so timestamps and frames cannot desynchronize.
     pub const ENCODER_STRIDE: usize = 8;
 
     /// Seconds covered by one encoder frame.
@@ -174,14 +175,8 @@ impl ParakeetTDTModel {
         &mut self,
         features: Array2<f32>,
     ) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<f32>)> {
-        // Run encoder
-        let (encoder_out, encoder_len) = self.run_encoder(&features)?;
-
-        // Run greedy decoding with decoder_joint
-        let (tokens, frame_indices, durations, confidences) =
-            self.greedy_decode(&encoder_out, encoder_len)?;
-
-        Ok((tokens, frame_indices, durations, confidences))
+        let (d, _) = self.decode(features, None)?;
+        Ok((d.tokens, d.frame_indices, d.durations, d.confidences))
     }
 
     /// Like [`forward`](Self::forward), but also hands back the encoder hidden states that
@@ -199,12 +194,24 @@ impl ParakeetTDTModel {
         &mut self,
         features: Array2<f32>,
     ) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<f32>, Array3<f32>)> {
+        let (d, encoder_out) = self.decode(features, None)?;
+        Ok((d.tokens, d.frame_indices, d.durations, d.confidences, encoder_out))
+    }
+
+    /// Encode `features` and decode greedily, optionally biased by `booster`; returns the decode
+    /// and the encoder output it ran on (`[batch, encoder_dim, time]`).
+    ///
+    /// With `booster = None` this is exactly [`forward_with_encoder`](Self::forward_with_encoder).
+    /// The caller must have checked that `booster` was built for this model's vocabulary
+    /// (`PhraseBooster::check_vocab`); token ids are all this level sees.
+    pub(crate) fn decode(
+        &mut self,
+        features: Array2<f32>,
+        booster: Option<&PhraseBooster>,
+    ) -> Result<(Decoded, Array3<f32>)> {
         let (encoder_out, encoder_len) = self.run_encoder(&features)?;
-
-        let (tokens, frame_indices, durations, confidences) =
-            self.greedy_decode(&encoder_out, encoder_len)?;
-
-        Ok((tokens, frame_indices, durations, confidences, encoder_out))
+        let decoded = self.greedy_decode(&encoder_out, encoder_len, booster)?;
+        Ok((decoded, encoder_out))
     }
 
     fn run_encoder(&mut self, features: &Array2<f32>) -> Result<(Array3<f32>, i64)> {
@@ -262,13 +269,13 @@ impl ParakeetTDTModel {
         &mut self,
         encoder_out: &Array3<f32>,
         _encoder_len: i64,
-    ) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<f32>)> {
+        booster: Option<&PhraseBooster>,
+    ) -> Result<Decoded> {
         // encoder_out shape: [batch, encoder_dim, time]
         let time_steps = encoder_out.shape()[2];
         let vocab_size = self.config.vocab_size;
         let mut joint = OnnxJoint::new(&mut self.decoder_joint, encoder_out);
-        let d = decode_steps(&mut joint, time_steps, vocab_size)?;
-        Ok((d.tokens, d.frame_indices, d.durations, d.confidences))
+        decode_steps(&mut joint, time_steps, vocab_size, booster)
     }
 }
 
@@ -292,6 +299,9 @@ pub(crate) struct Decoded {
     pub frame_indices: Vec<usize>,
     pub durations: Vec<usize>,
     pub confidences: Vec<f32>,
+    /// What the booster's cursor saw, one `changed` entry per emitted token; `None` exactly when
+    /// the decode ran without a booster (an empty booster still leaves a trace).
+    pub trace: Option<BoostTrace>,
 }
 
 /// Index of the largest value. Of equal maxima the LAST wins, and NaN compares as Equal
@@ -322,10 +332,15 @@ fn token_confidence(vocab_logits: &[f32], token_id: usize, blank_id: usize) -> f
 /// Knows the walk: the token and duration argmaxes, that a duration > 0 jumps that many frames,
 /// that a blank (or `max_tokens_per_step` symbols on one frame) advances one frame, and that the
 /// prediction network advances only on emission. It knows nothing about ONNX; `joint` does.
+///
+/// With a `booster`, its cursor picks each token (blank vs non-blank stays the unbiased decision)
+/// and is told every emitted token; nothing else in the walk changes. Confidence is always the
+/// softmax of the chosen token under the UNBIASED logits. `booster = None` is today's decode.
 pub(crate) fn decode_steps(
     joint: &mut dyn Joint,
     time_steps: usize,
     vocab_size: usize,
+    booster: Option<&PhraseBooster>,
 ) -> Result<Decoded> {
     let max_tokens_per_step = 10;
     let blank_id = vocab_size - 1;
@@ -338,6 +353,7 @@ pub(crate) fn decode_steps(
     let mut t = 0;
     let mut emitted_tokens = 0;
     let mut last_emitted_token = blank_id as i32;
+    let mut cursor = booster.map(PhraseBooster::cursor);
 
     // Frame-by-frame RNN-T/TDT greedy decoding
     while t < time_steps {
@@ -347,9 +363,12 @@ pub(crate) fn decode_steps(
         let vocab_logits: Vec<f32> = logits_data.iter().take(vocab_size).copied().collect();
         let duration_logits: Vec<f32> = logits_data.iter().skip(vocab_size).copied().collect();
 
-        let token_id = argmax_last(&vocab_logits).unwrap_or(blank_id);
+        let token_id = match cursor.as_mut() {
+            Some(c) => c.pick(&vocab_logits),
+            None => argmax_last(&vocab_logits).unwrap_or(blank_id),
+        };
 
-        // Compute softmax probability of the winning token for confidence scoring
+        // Softmax probability of the chosen token under the UNBIASED logits, for confidence
         let token_confidence = token_confidence(&vocab_logits, token_id, blank_id);
 
         let duration_step = if !duration_logits.is_empty() {
@@ -369,6 +388,9 @@ pub(crate) fn decode_steps(
             confidences.push(token_confidence);
             last_emitted_token = token_id as i32;
             emitted_tokens += 1;
+            if let Some(c) = cursor.as_mut() {
+                c.emitted(token_id);
+            }
         }
         // When duration > 0, skip frames according to duration prediction
         // Otherwise advance by 1 on blank or when max tokens reached
@@ -381,7 +403,13 @@ pub(crate) fn decode_steps(
         }
     }
 
-    Ok(Decoded { tokens, frame_indices, durations, confidences })
+    Ok(Decoded {
+        tokens,
+        frame_indices,
+        durations,
+        confidences,
+        trace: cursor.map(|c| c.finish()),
+    })
 }
 
 /// Raw `(dims, data)` of one extracted output state, not yet shaped.
@@ -547,7 +575,7 @@ mod decode_tests {
     #[test]
     fn blank_advances_one_frame() {
         let mut j = ScriptedJoint::ok(vec![step(BLANK, 0), step(BLANK, 0), step(BLANK, 0)]);
-        let d = decode_steps(&mut j, 3, VOCAB).unwrap();
+        let d = decode_steps(&mut j, 3, VOCAB, None).unwrap();
         assert_eq!(j.times(), vec![0, 1, 2]);
         assert!(d.tokens.is_empty());
         assert!(j.accepted.is_empty());
@@ -562,7 +590,7 @@ mod decode_tests {
         steps.push(step(1, 0));
         steps.push(step(BLANK, 0));
         let mut j = ScriptedJoint::ok(steps);
-        let d = decode_steps(&mut j, 3, VOCAB).unwrap();
+        let d = decode_steps(&mut j, 3, VOCAB, None).unwrap();
         let mut want = vec![0; 10];
         want.extend([2, 2]);
         assert_eq!(j.times(), want);
@@ -576,7 +604,7 @@ mod decode_tests {
     fn duration_on_the_first_frame_jumps_straight_there() {
         // tok1 with duration argmax 2 at t=0 → next call at t=2.
         let mut j = ScriptedJoint::ok(vec![step(1, 2), step(BLANK, 0)]);
-        let d = decode_steps(&mut j, 3, VOCAB).unwrap();
+        let d = decode_steps(&mut j, 3, VOCAB, None).unwrap();
         assert_eq!(j.times(), vec![0, 2]);
         assert_eq!(d.tokens, vec![1]);
         assert_eq!(d.frame_indices, vec![0]);
@@ -588,7 +616,7 @@ mod decode_tests {
         let mut steps = vec![step(1, 0); 10];
         steps.push(step(BLANK, 0));
         let mut j = ScriptedJoint::ok(steps);
-        let d = decode_steps(&mut j, 2, VOCAB).unwrap();
+        let d = decode_steps(&mut j, 2, VOCAB, None).unwrap();
         let mut want = vec![0; 10];
         want.push(1);
         assert_eq!(j.times(), want);
@@ -600,7 +628,7 @@ mod decode_tests {
         // [tok1, blank, tok2]: two accepts; the prediction network sees blank, then tok1 twice
         // (a blank does not change the last emitted token).
         let mut j = ScriptedJoint::ok(vec![step(1, 0), step(BLANK, 0), step(2, 1)]);
-        let d = decode_steps(&mut j, 2, VOCAB).unwrap();
+        let d = decode_steps(&mut j, 2, VOCAB, None).unwrap();
         assert_eq!(j.last_tokens(), vec![BLANK as i32, 1, 1]);
         assert_eq!(j.accepted, vec![0, 2]);
         assert_eq!(d.tokens, vec![1, 2]);
@@ -616,7 +644,7 @@ mod decode_tests {
             (step(2, 0), false),
             (step(BLANK, 0), true),
         ]);
-        let d = decode_steps(&mut j, 1, VOCAB).unwrap();
+        let d = decode_steps(&mut j, 1, VOCAB, None).unwrap();
         assert_eq!(d.tokens, vec![1, 2]);
         assert_eq!(j.state, Some(0));
         assert_eq!(j.accepted, vec![0]);
@@ -636,12 +664,219 @@ mod decode_tests {
         let mut first = vec![2.0, 1.0, 0.0, -1.0];
         first.extend([0.0, 5.0, 0.0, 0.0, 0.0]); // duration 1
         let mut j = ScriptedJoint::ok(vec![first, step(BLANK, 0)]);
-        let d = decode_steps(&mut j, 2, VOCAB).unwrap();
+        let d = decode_steps(&mut j, 2, VOCAB, None).unwrap();
         let sum: f32 = [2.0f32, 1.0, 0.0, -1.0].iter().map(|l| (l - 2.0).exp()).sum();
         assert_eq!(d.tokens, vec![0]);
         assert!((d.confidences[0] - 1.0 / sum).abs() < 1e-6);
         // A blank is never recorded; its confidence, were it asked for, is 0.
         assert_eq!(d.confidences.len(), 1);
         assert_eq!(token_confidence(&[0.0, 0.0, 0.0, 9.0], BLANK, BLANK), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod boost_decode_tests {
+    use super::*;
+    use crate::phrase_boost::{PhraseBooster, RawHit};
+
+    /// A 10-piece vocab, blank last. `cairn` = `▁ca irn`, `dogs` = `▁dog s`.
+    const V: usize = 10;
+    const BLANK: usize = 9;
+    const N_DUR: usize = 5;
+    const CA: usize = 1;
+    const IRN: usize = 2;
+    const THE: usize = 3;
+
+    fn pieces() -> Vec<String> {
+        ["<unk>", "▁ca", "irn", "▁the", "▁dog", "s", "▁cat", "▁a", "b", "<blk>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn booster(phrases: &[&str], strength: f32) -> PhraseBooster {
+        let p: Vec<String> = phrases.iter().map(|s| s.to_string()).collect();
+        PhraseBooster::new(&pieces(), BLANK, &p, strength)
+    }
+
+    /// Replays logits by call index, whatever token is fed back, and records the calls.
+    struct Replay {
+        script: Vec<Vec<f32>>,
+        calls: Vec<(usize, i32)>,
+        /// Call indices whose state was accepted, i.e. that emitted a token.
+        accepted: Vec<usize>,
+    }
+
+    impl Replay {
+        fn new(script: Vec<Vec<f32>>) -> Self {
+            Self { script, calls: Vec::new(), accepted: Vec::new() }
+        }
+    }
+
+    impl Joint for Replay {
+        fn logits(&mut self, t: usize, last_token: i32) -> Result<Vec<f32>> {
+            let i = self.calls.len();
+            assert!(i < self.script.len(), "script exhausted at call {i} (t={t})");
+            self.calls.push((t, last_token));
+            Ok(self.script[i].clone())
+        }
+        fn accept(&mut self) -> Result<()> {
+            self.accepted.push(self.calls.len() - 1);
+            Ok(())
+        }
+    }
+
+    /// 300 steps from a fixed-seed LCG. Token logits are small integers, so exact ties are
+    /// common (blank included); the duration head picks 0..4, so frames are skipped.
+    fn lcg_script() -> Vec<Vec<f32>> {
+        let mut s: u64 = 0x5eed;
+        let mut next = move || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 33) as u32
+        };
+        (0..300)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..V).map(|_| (next() % 4) as f32).collect();
+                // Duration 0 most often, so several symbols land on one frame.
+                let dur = match next() % 8 {
+                    0..=3 => 0,
+                    d => (d - 3) as usize,
+                };
+                let mut durs = vec![0.0f32; N_DUR];
+                durs[dur] = 1.0;
+                v.extend(durs);
+                v
+            })
+            .collect()
+    }
+
+    /// Encoder frames for the LCG script: few enough that 300 calls always suffice.
+    const LCG_FRAMES: usize = 40;
+
+    fn run(script: &[Vec<f32>], frames: usize, b: Option<&PhraseBooster>) -> (Decoded, Replay) {
+        let mut j = Replay::new(script.to_vec());
+        let d = decode_steps(&mut j, frames, V, b).unwrap();
+        (d, j)
+    }
+
+    fn assert_identical(a: &Decoded, b: &Decoded) {
+        assert_eq!(a.tokens, b.tokens);
+        assert_eq!(a.frame_indices, b.frame_indices);
+        assert_eq!(a.durations, b.durations);
+        let bits = |d: &Decoded| d.confidences.iter().map(|c| c.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(a), bits(b));
+    }
+
+    #[test]
+    fn the_lcg_script_exercises_blanks_ties_and_skips() {
+        let script = lcg_script();
+        let (d, j) = run(&script, LCG_FRAMES, None);
+        let calls = j.calls.len();
+        let vocab = |i: usize| &script[i][..V];
+        let max = |i: usize| vocab(i).iter().cloned().fold(f32::MIN, f32::max);
+        assert!((0..calls).any(|i| argmax_last(vocab(i)) == Some(BLANK)), "a blank");
+        assert!(
+            (0..calls).any(|i| vocab(i).iter().filter(|&&x| x == max(i)).count() > 1),
+            "a tie"
+        );
+        assert!(d.durations.iter().any(|&x| x > 1), "a skip");
+        assert!(!d.tokens.is_empty());
+    }
+
+    #[test]
+    fn no_booster_and_an_empty_booster_decode_identically() {
+        let script = lcg_script();
+        let (plain, pj) = run(&script, LCG_FRAMES, None);
+        assert!(plain.trace.is_none());
+        let empty = booster(&[], 5.0);
+        assert!(empty.is_empty());
+        let (boosted, bj) = run(&script, LCG_FRAMES, Some(&empty));
+        assert_identical(&plain, &boosted);
+        assert_eq!(pj.calls, bj.calls);
+        // The empty booster really ran its cursor: one entry per emitted token, none changed.
+        let trace = boosted.trace.expect("a booster always leaves a trace");
+        assert_eq!(trace.changed.len(), boosted.tokens.len());
+        assert!(trace.changed.iter().all(|&c| !c));
+        assert!(trace.hits.is_empty());
+    }
+
+    #[test]
+    fn zero_strength_decodes_like_no_booster() {
+        let script = lcg_script();
+        let (plain, pj) = run(&script, LCG_FRAMES, None);
+        let b = booster(&["cairn", "dogs"], 0.0);
+        assert!(!b.is_empty());
+        let (boosted, bj) = run(&script, LCG_FRAMES, Some(&b));
+        assert_identical(&plain, &boosted);
+        assert_eq!(pj.calls, bj.calls);
+        assert!(boosted.trace.unwrap().changed.iter().all(|&c| !c));
+    }
+
+    #[test]
+    fn a_blank_decision_is_never_changed_by_boosting() {
+        let script = lcg_script();
+        let b = booster(&["cairn", "dogs"], PhraseBooster::MAX_STRENGTH);
+        let (boosted, j) = run(&script, LCG_FRAMES, Some(&b));
+        // A call emits exactly when its UNBIASED argmax is non-blank.
+        let want: Vec<usize> = (0..j.calls.len())
+            .filter(|&i| argmax_last(&script[i][..V]) != Some(BLANK))
+            .collect();
+        assert_eq!(j.accepted, want);
+        let trace = boosted.trace.unwrap();
+        // Boosting did act on this script, so the identity above is not vacuous.
+        assert!(trace.changed.iter().any(|&c| c), "boosting changed nothing");
+    }
+
+    /// Logits with token `tok_logits` (others 0) and duration argmax `dur`.
+    fn step(tok_logits: &[(usize, f32)], dur: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; V + N_DUR];
+        for &(t, x) in tok_logits {
+            v[t] = x;
+        }
+        v[V + dur] = 5.0;
+        v
+    }
+
+    /// `▁ca` (skipping 2 frames), a blank, then `▁the` narrowly ahead of `irn`.
+    fn cairn_script() -> Vec<Vec<f32>> {
+        vec![
+            step(&[(CA, 3.0)], 2),
+            step(&[(BLANK, 3.0)], 0),
+            step(&[(THE, 2.0), (IRN, 1.0)], 1),
+            step(&[(BLANK, 3.0)], 0),
+        ]
+    }
+
+    #[test]
+    fn boosting_completes_a_phrase_across_blanks_and_skips() {
+        let script = cairn_script();
+        let (plain, _) = run(&script, 5, None);
+        assert_eq!(plain.tokens, vec![CA, THE]);
+
+        let b = booster(&["cairn"], 1.0);
+        let (boosted, j) = run(&script, 5, Some(&b));
+        assert_eq!(boosted.tokens, vec![CA, IRN]);
+        assert_eq!(boosted.frame_indices, vec![0, 3]);
+        // The duration head is untouched by boosting.
+        assert_eq!(boosted.durations, plain.durations);
+        // The prediction network is fed the boosted token.
+        assert_eq!(j.calls, vec![(0, BLANK as i32), (2, CA as i32), (3, CA as i32), (4, IRN as i32)]);
+        let trace = boosted.trace.unwrap();
+        assert_eq!(trace.changed, vec![false, true]);
+        assert_eq!(trace.hits, vec![RawHit { phrase: 0, first: 0, last: 1 }]);
+    }
+
+    #[test]
+    fn confidence_comes_from_the_unbiased_logits() {
+        let script = cairn_script();
+        let b = booster(&["cairn"], 1.0);
+        let (boosted, _) = run(&script, 5, Some(&b));
+        assert_eq!(boosted.tokens[1], IRN);
+        // Softmax over the raw logits, where `▁the` (2.0) still beats `irn` (1.0).
+        let raw = &script[2][..V];
+        let sum: f32 = raw.iter().map(|&l| (l - 2.0).exp()).sum();
+        let want = (1.0f32 - 2.0).exp() / sum;
+        assert_eq!(boosted.confidences[1].to_bits(), want.to_bits());
+        assert!(boosted.confidences[1] < 0.5);
     }
 }

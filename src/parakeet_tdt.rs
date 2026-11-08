@@ -1,10 +1,11 @@
 use crate::audio::{self, FeatureCache};
 use crate::config::PreprocessorConfig;
 use crate::decoder::TranscriptionResult;
-use crate::decoder_tdt::ParakeetTDTDecoder;
+use crate::decoder_tdt::{token_start_seconds, ParakeetTDTDecoder};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
-use crate::model_tdt::{EncoderStates, ParakeetTDTModel};
+use crate::model_tdt::{Decoded, EncoderStates, ParakeetTDTModel};
+use crate::phrase_boost::{BoostHit, BoostOutcome, PhraseBooster};
 use crate::timestamps::{process_timestamps, TimestampMode};
 use crate::transcriber::Transcriber;
 use crate::vocab::Vocabulary;
@@ -107,13 +108,56 @@ impl ParakeetTDT {
         channels: u16,
         mode: Option<TimestampMode>,
     ) -> Result<(TranscriptionResult, EncoderStates)> {
-        let (result, states) = self.run(audio, sample_rate, channels, mode, true)?;
+        let (result, states, _) = self.run(audio, sample_rate, channels, mode, true, None)?;
         // `want_encoder = true` always populates it.
         Ok((result, states.expect("encoder states requested")))
     }
 
+    /// Compile `phrases` into a booster for this model's vocabulary at `strength` (clamped to
+    /// `[0, PhraseBooster::MAX_STRENGTH]`). About a millisecond; build once, reuse across calls.
+    /// Phrases it cannot boost are listed in [`PhraseBooster::skipped`] with their reason.
+    pub fn phrase_booster(&self, phrases: &[String], strength: f32) -> PhraseBooster {
+        let vocab = self.decoder.vocab();
+        // The decode loop's blank is `vocab_size - 1`, and the model's `vocab_size` is
+        // `vocab.size()`; pass that same id so the booster and the loop cannot disagree.
+        let blank_id = vocab.size().saturating_sub(1);
+        PhraseBooster::new(&vocab.id_to_token, blank_id, phrases, strength)
+    }
+
+    /// [`transcribe_samples_with_encoder`](Self::transcribe_samples_with_encoder), with the greedy
+    /// decode biased toward `booster`'s phrases, plus what boosting did.
+    ///
+    /// `booster = None` is exactly `transcribe_samples_with_encoder`, and its outcome still
+    /// carries every emitted token id. An empty booster runs the boosted path and decodes
+    /// identically to `None`. A booster built for another model's vocabulary is an
+    /// `Error::Config`, never a silent unboosted decode. Hit times share the word timestamps' clock.
+    pub fn transcribe_boosted(
+        &mut self,
+        audio: Vec<f32>,
+        sample_rate: u32,
+        channels: u16,
+        mode: Option<TimestampMode>,
+        booster: Option<&PhraseBooster>,
+    ) -> Result<(TranscriptionResult, EncoderStates, BoostOutcome)> {
+        if let Some(b) = booster {
+            b.check_vocab(&self.decoder.vocab().id_to_token)?;
+        }
+        let (result, states, decoded) =
+            self.run(audio, sample_rate, channels, mode, true, booster)?;
+        let states = states.expect("encoder states requested");
+        let outcome = boost_outcome(
+            &decoded,
+            booster,
+            self.preprocessor_config.hop_length,
+            self.preprocessor_config.sampling_rate,
+            states.seconds_per_frame() as f32,
+        );
+        Ok((result, states, outcome))
+    }
+
     /// Shared body of the transcribe paths. `want_encoder` decides only whether the encoder
-    /// output is copied out; the decode is bit-identical either way.
+    /// output is copied out; the decode is bit-identical either way. `booster` must already have
+    /// passed `check_vocab` against this model.
     fn run(
         &mut self,
         audio: Vec<f32>,
@@ -121,7 +165,8 @@ impl ParakeetTDT {
         channels: u16,
         mode: Option<TimestampMode>,
         want_encoder: bool,
-    ) -> Result<(TranscriptionResult, Option<EncoderStates>)> {
+        booster: Option<&PhraseBooster>,
+    ) -> Result<(TranscriptionResult, Option<EncoderStates>, Decoded)> {
         // Keep upstream's cached feature extraction (v0.3.6 perf win) AND our
         // confidence return value from forward().
         let features = audio::extract_features_with_cache(
@@ -131,24 +176,20 @@ impl ParakeetTDT {
             &self.preprocessor_config,
             &self.feature_cache,
         )?;
-        let (tokens, frame_indices, durations, confidences, encoder) = if want_encoder {
-            let (t, f, d, c, enc) = self.model.forward_with_encoder(features)?;
-            let states = EncoderStates::from_encoder_out(
+        let (decoded, enc) = self.model.decode(features, booster)?;
+        let encoder = want_encoder.then(|| {
+            EncoderStates::from_encoder_out(
                 &enc,
                 self.preprocessor_config.hop_length,
                 self.preprocessor_config.sampling_rate,
-            );
-            (t, f, d, c, Some(states))
-        } else {
-            let (t, f, d, c) = self.model.forward(features)?;
-            (t, f, d, c, None)
-        };
+            )
+        });
 
         let mut result = self.decoder.decode_with_timestamps(
-            &tokens,
-            &frame_indices,
-            &durations,
-            &confidences,
+            &decoded.tokens,
+            &decoded.frame_indices,
+            &decoded.durations,
+            &decoded.confidences,
             self.preprocessor_config.hop_length,
             self.preprocessor_config.sampling_rate,
         )?;
@@ -188,8 +229,40 @@ impl ParakeetTDT {
                 .join(" ")
         };
 
-        Ok((result, encoder))
+        Ok((result, encoder, decoded))
     }
+}
+
+/// What boosting did to `decoded`, in seconds on the word timestamps' clock. A hit spans from
+/// the start of its first token to the end of the frame its last token sits on. `token_ids` is
+/// filled whether or not a booster ran.
+fn boost_outcome(
+    decoded: &Decoded,
+    booster: Option<&PhraseBooster>,
+    hop_length: usize,
+    sample_rate: usize,
+    seconds_per_frame: f32,
+) -> BoostOutcome {
+    let mut outcome = BoostOutcome {
+        token_ids: decoded.tokens.clone(),
+        ..BoostOutcome::default()
+    };
+    let (Some(b), Some(trace)) = (booster, decoded.trace.as_ref()) else {
+        return outcome;
+    };
+    let at = |i: usize| token_start_seconds(decoded.frame_indices[i], hop_length, sample_rate);
+    outcome.changed_tokens = trace.changed.iter().filter(|&&c| c).count();
+    outcome.hits = trace
+        .hits
+        .iter()
+        .map(|h| BoostHit {
+            phrase: b.phrases()[h.phrase as usize].clone(),
+            start: at(h.first),
+            end: at(h.last) + seconds_per_frame,
+            changed: trace.changed[h.first..=h.last].iter().any(|&c| c),
+        })
+        .collect();
+    outcome
 }
 
 impl Transcriber for ParakeetTDT {
@@ -200,7 +273,67 @@ impl Transcriber for ParakeetTDT {
         channels: u16,
         mode: Option<TimestampMode>,
     ) -> Result<TranscriptionResult> {
-        let (result, _) = self.run(audio, sample_rate, channels, mode, false)?;
+        let (result, _, _) = self.run(audio, sample_rate, channels, mode, false, None)?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decoder_tdt::token_start_seconds;
+    use crate::model_tdt::Decoded;
+    use crate::phrase_boost::{BoostTrace, RawHit};
+
+    fn booster() -> PhraseBooster {
+        let v: Vec<String> = ["<unk>", "▁ca", "irn", "▁dog", "s", "▁the", "<blk>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let p: Vec<String> = ["dogs", "cairn"].iter().map(|s| s.to_string()).collect();
+        PhraseBooster::new(&v, 6, &p, 1.0)
+    }
+
+    fn decoded(trace: Option<BoostTrace>) -> Decoded {
+        Decoded {
+            tokens: vec![5, 1, 2, 3, 4],
+            frame_indices: vec![0, 4, 6, 10, 12],
+            durations: vec![1, 2, 1, 2, 1],
+            confidences: vec![0.9; 5],
+            trace,
+        }
+    }
+
+    #[test]
+    fn hits_are_timed_on_the_decoders_clock() {
+        let b = booster();
+        let trace = BoostTrace {
+            changed: vec![false, false, true, false, false],
+            hits: vec![
+                RawHit { phrase: 1, first: 1, last: 2 },
+                RawHit { phrase: 0, first: 3, last: 4 },
+            ],
+        };
+        let spf = 0.08f32;
+        let o = boost_outcome(&decoded(Some(trace)), Some(&b), 160, 16000, spf);
+        assert_eq!(o.token_ids, vec![5, 1, 2, 3, 4]);
+        assert_eq!(o.changed_tokens, 1);
+        assert_eq!(o.hits.len(), 2);
+        assert_eq!(o.hits[0].phrase, "cairn");
+        assert_eq!(o.hits[0].start, token_start_seconds(4, 160, 16000));
+        assert_eq!(o.hits[0].end, token_start_seconds(6, 160, 16000) + spf);
+        assert!(o.hits[0].changed);
+        assert_eq!(o.hits[1].phrase, "dogs");
+        assert_eq!(o.hits[1].start, token_start_seconds(10, 160, 16000));
+        assert_eq!(o.hits[1].end, token_start_seconds(12, 160, 16000) + spf);
+        assert!(!o.hits[1].changed);
+    }
+
+    #[test]
+    fn an_unboosted_decode_still_reports_its_token_ids() {
+        let o = boost_outcome(&decoded(None), None, 160, 16000, 0.08);
+        assert_eq!(o.token_ids, vec![5, 1, 2, 3, 4]);
+        assert!(o.hits.is_empty());
+        assert_eq!(o.changed_tokens, 0);
     }
 }

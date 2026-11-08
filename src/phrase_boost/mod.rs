@@ -71,7 +71,6 @@ impl PhraseBooster {
     pub const MAX_STRENGTH: f32 = 5.0;
 
     /// `strength` is clamped to `[0, MAX_STRENGTH]`; NaN counts as 0 (no boost).
-    #[allow(dead_code)] // called by the model's booster constructor (A5)
     pub(crate) fn new(
         id_to_token: &[String],
         blank_id: usize,
@@ -185,7 +184,6 @@ impl PhraseBooster {
     /// `Err(Error::Config)` unless `id_to_token` is the vocabulary this booster
     /// was built from: the same length and the same piece strings. Token ids
     /// from another vocabulary would boost unrelated pieces, even at the same size.
-    #[allow(dead_code)] // called by the decode entry point (A5)
     pub(crate) fn check_vocab(&self, id_to_token: &[String]) -> crate::error::Result<()> {
         let fp = fingerprint(id_to_token);
         if id_to_token.len() == self.vocab_len && fp == self.vocab_fingerprint {
@@ -203,7 +201,6 @@ impl PhraseBooster {
 
     /// A fresh per-decode cursor at the tree's root. An empty booster still
     /// gives a real cursor, whose picks are plain argmax.
-    #[allow(dead_code)] // called by the decode loop (A5)
     pub(crate) fn cursor(&self) -> BoostCursor<'_> {
         BoostCursor {
             booster: self,
@@ -246,7 +243,6 @@ fn fingerprint(id_to_token: &[String]) -> u64 {
 /// joint output and `emitted` for each non-blank token it keeps. The tree
 /// state moves only in `emitted`, so blanks, duration skips and forced
 /// blanks leave it where it is.
-#[allow(dead_code)] // driven by the decode loop (A5)
 pub(crate) struct BoostCursor<'a> {
     booster: &'a PhraseBooster,
     state: NodeId,
@@ -256,7 +252,6 @@ pub(crate) struct BoostCursor<'a> {
     hits: Vec<RawHit>,
 }
 
-#[allow(dead_code)] // driven by the decode loop (A5)
 impl BoostCursor<'_> {
     /// The token to emit for these raw joint vocab logits (blank included).
     /// Blank versus non-blank is decided on the unbiased logits (research
@@ -326,7 +321,6 @@ impl BoostCursor<'_> {
 }
 
 /// What one decode's cursor saw, indexed by emitted token.
-#[allow(dead_code)] // read by the decode entry point (A5)
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct BoostTrace {
     /// Per emitted token: did boosting change it?
@@ -336,7 +330,6 @@ pub(crate) struct BoostTrace {
 
 /// A completed phrase: `phrase` indexes `PhraseBooster::phrases()`, and
 /// `first..=last` are emitted-token indices.
-#[allow(dead_code)] // read by the decode entry point (A5)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawHit {
     pub phrase: u32,

@@ -1,6 +1,13 @@
 use crate::decoder::TranscriptionResult;
 use crate::error::Result;
+use crate::model_tdt::EncoderStates;
 use crate::vocab::Vocabulary;
+
+/// Seconds at which a token emitted on encoder frame `frame` starts: the one clock shared by
+/// word timestamps and phrase-boost hit times.
+pub(crate) fn token_start_seconds(frame: usize, hop_length: usize, sample_rate: usize) -> f32 {
+    (frame * EncoderStates::ENCODER_STRIDE * hop_length) as f32 / sample_rate as f32
+}
 
 /// TDT greedy decoder for Parakeet TDT models
 #[derive(Debug)]
@@ -12,6 +19,11 @@ impl ParakeetTDTDecoder {
     /// Load decoder from vocab file
     pub fn from_vocab(vocab: Vocabulary) -> Self {
         Self { vocab }
+    }
+
+    /// The vocabulary token ids index into.
+    pub(crate) fn vocab(&self) -> &Vocabulary {
+        &self.vocab
     }
 
     /// Decode tokens with timestamps
@@ -27,15 +39,13 @@ impl ParakeetTDTDecoder {
     ) -> Result<TranscriptionResult> {
         let mut result_tokens = Vec::new();
         let mut full_text = String::new();
-        // TDT encoder does 8x subsampling
-        let encoder_stride = 8;
 
         for (i, &token_id) in tokens.iter().enumerate() {
             if let Some(token_text) = self.vocab.id_to_text(token_id) {
                 let frame = frame_indices[i];
-                let start = (frame * encoder_stride * hop_length) as f32 / sample_rate as f32;
+                let start = token_start_seconds(frame, hop_length, sample_rate);
                 let end = if i + 1 < frame_indices.len() {
-                    (frame_indices[i + 1] * encoder_stride * hop_length) as f32 / sample_rate as f32
+                    token_start_seconds(frame_indices[i + 1], hop_length, sample_rate)
                 } else {
                     start + 0.01
                 };
@@ -222,5 +232,22 @@ mod tests {
         // Test Tokens mode
         let tokens_text: String = result.tokens.iter().map(|t| t.text.as_str()).collect();
         assert_eq!(tokens_text.trim(), "like 100 bucks");
+    }
+
+    #[test]
+    fn hit_times_use_the_decoders_clock() {
+        for f in [0usize, 1, 7, 123, 4000] {
+            assert_eq!(token_start_seconds(f, 160, 16000), (f * 8 * 160) as f32 / 16000.0);
+        }
+        // decode_with_timestamps reads the same clock: start of each token, and the next
+        // token's start as the end.
+        let vocab = make_vocab(&["▁a", "▁b", "▁c"]);
+        let decoder = ParakeetTDTDecoder::from_vocab(vocab);
+        let r = decoder
+            .decode_with_timestamps(&[0, 1, 2], &[3, 17, 40], &[1, 1, 1], &[0.9, 0.9, 0.9], 160, 16000)
+            .unwrap();
+        assert_eq!(r.tokens[0].start, token_start_seconds(3, 160, 16000));
+        assert_eq!(r.tokens[0].end, token_start_seconds(17, 160, 16000));
+        assert_eq!(r.tokens[2].start, token_start_seconds(40, 160, 16000));
     }
 }
