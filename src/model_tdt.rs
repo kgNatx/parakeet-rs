@@ -688,7 +688,7 @@ mod decode_tests {
 #[cfg(test)]
 mod boost_decode_tests {
     use super::*;
-    use crate::phrase_boost::{PhraseBooster, RawHit};
+    use crate::phrase_boost::{BoostPhrase, PhraseBooster, RawHit};
 
     /// A 10-piece vocab, blank last. `cairn` = `▁ca irn`, `dogs` = `▁dog s`.
     const V: usize = 10;
@@ -706,10 +706,10 @@ mod boost_decode_tests {
     }
 
     fn booster(phrases: &[&str], strength: f32) -> PhraseBooster {
-        let p: Vec<String> = phrases.iter().map(|s| s.to_string()).collect();
+        let p: Vec<BoostPhrase> = phrases.iter().map(|s| BoostPhrase::new(*s, strength)).collect();
         let v = pieces();
         let t = crate::phrase_boost::fixture_tokenizer(&v, BLANK);
-        PhraseBooster::new(&v, BLANK, t, &p, strength).unwrap()
+        PhraseBooster::new(&v, BLANK, t, &p).unwrap()
     }
 
     /// Replays logits by call index, whatever token is fed back, and records the calls.
@@ -817,8 +817,10 @@ mod boost_decode_tests {
     fn zero_strength_decodes_like_no_booster() {
         let script = lcg_script();
         let (plain, pj) = run(&script, LCG_FRAMES, None);
+        // A phrase at strength 0 is skipped, so this is the empty booster's path.
         let b = booster(&["cairn", "dogs"], 0.0);
-        assert!(!b.is_empty());
+        assert!(b.is_empty());
+        assert_eq!(b.skipped().len(), 2);
         let (boosted, bj) = run(&script, LCG_FRAMES, Some(&b));
         assert_identical(&plain, &boosted);
         assert_eq!(pj.calls, bj.calls);

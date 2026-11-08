@@ -27,6 +27,22 @@ pub enum SkipReason {
     /// The tokenizer cannot spell it in the model's pieces: its encoding needs
     /// `<unk>`, a byte-fallback piece or another `<…>` piece.
     NotSpellable,
+    /// Its strength is 0 (or negative, or NaN, which clamp to 0): nothing to boost.
+    NoStrength,
+}
+
+/// One phrase to boost and how strongly, in nats per unit of NeMo tree score
+/// (research notes 1.6). Strengths are clamped to `[0, PhraseBooster::MAX_STRENGTH]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoostPhrase {
+    pub text: String,
+    pub strength: f32,
+}
+
+impl BoostPhrase {
+    pub fn new(text: impl Into<String>, strength: f32) -> BoostPhrase {
+        BoostPhrase { text: text.into(), strength }
+    }
 }
 
 /// A boosted phrase the decoder emitted.
@@ -54,19 +70,22 @@ pub struct BoostOutcome {
 const C0: f32 = 1.0;
 const BETA: f32 = 2.0;
 
-/// A list of phrases compiled for one model vocabulary, at one strength.
+/// A list of phrases, each with its own strength, compiled for one model vocabulary.
 ///
 /// Built once (about a millisecond), immutable, and shared by every decode
 /// that should be boosted; each decode walks it with its own `cursor()`.
 /// Phrases are deduplicated case-insensitively: one entry, named by the
-/// first casing, carrying the spellings of every casing given. A phrase that cannot be
-/// boosted is kept in `skipped()` with its reason, never silently lost.
+/// first casing, carrying the spellings of every casing given and the largest
+/// of their strengths. Where two phrases' spellings share their first pieces,
+/// those pieces are boosted at the larger strength until the spellings part. A
+/// phrase that cannot be boosted is kept in `skipped()` with its reason, never
+/// silently lost.
 pub struct PhraseBooster {
-    phrases: Vec<String>,
+    /// Boosted phrases, strengths clamped.
+    phrases: Vec<BoostPhrase>,
     /// Per entry of `phrases`, its spellings as piece strings.
     spellings: Vec<Vec<Vec<String>>>,
     skipped: Vec<(String, SkipReason)>,
-    strength: f32,
     blank_id: usize,
     tree: Tree,
     vocab_len: usize,
@@ -79,18 +98,17 @@ impl PhraseBooster {
     /// NeMo-Speech.cpp's greedy-safe ceiling for the strength.
     pub const MAX_STRENGTH: f32 = 5.0;
 
-    /// `strength` is clamped to `[0, MAX_STRENGTH]`; NaN counts as 0 (no boost).
-    /// `tokenizer` spells the phrases and must hold exactly `id_to_token`'s
+    /// Each strength is clamped to `[0, MAX_STRENGTH]`; NaN counts as 0, and a
+    /// phrase at 0 is skipped (`SkipReason::NoStrength`). `tokenizer` spells the phrases and must hold exactly `id_to_token`'s
     /// pieces, blank excepted, at the same ids (`Error::Config` otherwise).
     pub(crate) fn new(
         id_to_token: &[String],
         blank_id: usize,
         tokenizer: Tokenizer,
-        phrases: &[String],
-        strength: f32,
+        phrases: &[BoostPhrase],
     ) -> Result<PhraseBooster> {
         let speller = Speller::new(tokenizer, id_to_token, blank_id)?;
-        Ok(Self::compile(id_to_token, blank_id, Some(&speller), phrases, strength))
+        Ok(Self::compile(id_to_token, blank_id, Some(&speller), phrases))
     }
 
     /// `new` once the speller is built; `speller` is `None` only for an empty
@@ -99,29 +117,33 @@ impl PhraseBooster {
         id_to_token: &[String],
         blank_id: usize,
         speller: Option<&Speller>,
-        phrases: &[String],
-        strength: f32,
+        phrases: &[BoostPhrase],
     ) -> PhraseBooster {
         debug_assert!(speller.is_some() || phrases.is_empty());
-        // One entry per case-insensitive key, named by its first casing; every
-        // casing given contributes its spellings (an as-written variant can
-        // reach pieces the others cannot).
-        let mut groups: Vec<(&String, Vec<&String>)> = Vec::new();
+        // One entry per case-insensitive key, named by its first casing, at the
+        // largest strength given; every casing given contributes its spellings
+        // (an as-written variant can reach pieces the others cannot).
+        let mut groups: Vec<(&String, f32, Vec<&String>)> = Vec::new();
         let mut group_of: HashMap<String, usize> = HashMap::new();
         for phrase in phrases {
-            match group_of.entry(dedup_key(phrase)) {
-                Entry::Occupied(e) => groups[*e.get()].1.push(phrase),
+            let strength = clamp_strength(phrase.strength);
+            match group_of.entry(dedup_key(&phrase.text)) {
+                Entry::Occupied(e) => {
+                    let g = &mut groups[*e.get()];
+                    g.1 = g.1.max(strength);
+                    g.2.push(&phrase.text);
+                }
                 Entry::Vacant(e) => {
                     e.insert(groups.len());
-                    groups.push((phrase, vec![phrase]));
+                    groups.push((&phrase.text, strength, vec![&phrase.text]));
                 }
             }
         }
         let mut kept = Vec::new();
         let mut spellings = Vec::new();
         let mut skipped = Vec::new();
-        let mut seqs: Vec<(Vec<u32>, u32)> = Vec::new();
-        for (phrase, casings) in groups {
+        let mut seqs: Vec<(Vec<u32>, u32, f32)> = Vec::new();
+        for (phrase, strength, casings) in groups {
             let mut ss: Vec<Vec<u32>> = Vec::new();
             let mut first_err = None;
             for casing in casings {
@@ -134,6 +156,12 @@ impl PhraseBooster {
             }
             ss.sort();
             ss.dedup();
+            // A spelling problem is reported before a zero strength: it is the
+            // thing that would still stop the phrase at any strength.
+            if !ss.is_empty() && strength == 0.0 {
+                skipped.push((phrase.clone(), SkipReason::NoStrength));
+                continue;
+            }
             if ss.is_empty() {
                 let reason = first_err.unwrap_or(SkipReason::NotSpellable);
                 skipped.push((phrase.clone(), reason));
@@ -149,19 +177,13 @@ impl PhraseBooster {
                     })
                     .collect(),
             );
-            seqs.extend(ss.into_iter().map(|s| (s, index)));
-            kept.push(phrase.clone());
+            seqs.extend(ss.into_iter().map(|s| (s, index, strength)));
+            kept.push(BoostPhrase::new(phrase.clone(), strength));
         }
-        let strength = if strength.is_nan() {
-            0.0
-        } else {
-            strength.clamp(0.0, Self::MAX_STRENGTH)
-        };
         PhraseBooster {
             phrases: kept,
             spellings,
             skipped,
-            strength,
             blank_id,
             tree: Tree::build(&seqs, C0, BETA),
             vocab_len: id_to_token.len(),
@@ -177,15 +199,14 @@ impl PhraseBooster {
     pub(crate) fn from_vocabulary(
         vocab: &Vocabulary,
         tokenizer: &Path,
-        phrases: &[String],
-        strength: f32,
+        phrases: &[BoostPhrase],
     ) -> Result<PhraseBooster> {
         let blank_id = crate::model_tdt::tdt_blank_id(vocab.size());
         if phrases.is_empty() {
-            return Ok(Self::compile(&vocab.id_to_token, blank_id, None, phrases, strength));
+            return Ok(Self::compile(&vocab.id_to_token, blank_id, None, phrases));
         }
         let tokenizer = spell::load_tokenizer(tokenizer)?;
-        PhraseBooster::new(&vocab.id_to_token, blank_id, tokenizer, phrases, strength)
+        PhraseBooster::new(&vocab.id_to_token, blank_id, tokenizer, phrases)
     }
 
     /// Compile `phrases` for the vocabulary in a model dir's `vocab.txt`, spelled by the
@@ -195,10 +216,9 @@ impl PhraseBooster {
     pub fn from_files(
         vocab: &Path,
         tokenizer: &Path,
-        phrases: &[String],
-        strength: f32,
+        phrases: &[BoostPhrase],
     ) -> Result<PhraseBooster> {
-        Self::from_vocabulary(&Vocabulary::from_file(vocab)?, tokenizer, phrases, strength)
+        Self::from_vocabulary(&Vocabulary::from_file(vocab)?, tokenizer, phrases)
     }
 
     /// The vocabulary this booster was built for, `id -> piece`.
@@ -206,19 +226,15 @@ impl PhraseBooster {
         &self.pieces
     }
 
-    /// The boosted phrases, in first-seen order. `RawHit::phrase` indexes this.
-    pub fn phrases(&self) -> &[String] {
+    /// The boosted phrases with their clamped strengths, in first-seen order.
+    /// `RawHit::phrase` indexes this.
+    pub fn phrases(&self) -> &[BoostPhrase] {
         &self.phrases
     }
 
     /// Phrases left out, in first-seen order, each with why.
     pub fn skipped(&self) -> &[(String, SkipReason)] {
         &self.skipped
-    }
-
-    /// The clamped strength (α), in nats per unit of tree score.
-    pub fn strength(&self) -> f32 {
-        self.strength
     }
 
     /// True when no phrase is boosted. An empty booster picks as plain argmax.
@@ -238,7 +254,7 @@ impl PhraseBooster {
         let key = dedup_key(phrase);
         self.phrases
             .iter()
-            .position(|p| dedup_key(p) == key)
+            .position(|p| dedup_key(&p.text) == key)
             .map(|i| self.spellings[i].clone())
             .unwrap_or_default()
     }
@@ -271,6 +287,15 @@ impl PhraseBooster {
             changed: Vec::new(),
             hits: Vec::new(),
         }
+    }
+}
+
+/// `[0, MAX_STRENGTH]`; NaN is 0.
+fn clamp_strength(strength: f32) -> f32 {
+    if strength.is_nan() {
+        0.0
+    } else {
+        strength.clamp(0.0, PhraseBooster::MAX_STRENGTH)
     }
 }
 
@@ -318,8 +343,9 @@ impl BoostCursor<'_> {
     /// The token to emit for these raw joint vocab logits (blank included).
     /// Blank versus non-blank is decided on the unbiased logits (research
     /// notes 1.4); boosting only re-ranks which non-blank token wins, by adding
-    /// `strength * bonus` (notes 1.6). A token must strictly beat the unbiased
-    /// pick's boosted score, so strength 0 is plain argmax, ties included.
+    /// each token's bonus, already scaled by its phrases' strengths (notes 1.6).
+    /// A token must strictly beat the unbiased pick's boosted score, so a
+    /// booster with nothing to boost is plain argmax, ties included.
     pub(crate) fn pick(&mut self, vocab_logits: &[f32]) -> usize {
         let b = self.booster;
         let unbiased = argmax_last(vocab_logits).unwrap_or(b.blank_id);
@@ -327,11 +353,10 @@ impl BoostCursor<'_> {
         if unbiased == b.blank_id {
             return unbiased;
         }
-        let alpha = b.strength;
         let bonus = b.tree.step_bonus(self.state);
         // Identity by construction, not by arithmetic: with a NaN in the
         // logits, `unbiased` need not be the largest finite logit.
-        if alpha == 0.0 || bonus.is_empty() {
+        if bonus.is_empty() {
             return unbiased;
         }
         let own = bonus
@@ -339,14 +364,14 @@ impl BoostCursor<'_> {
             .find(|&&(tok, _)| tok as usize == unbiased)
             .map_or(0.0, |&(_, x)| x);
         let mut best = unbiased;
-        let mut best_score = vocab_logits[unbiased] + alpha * own;
+        let mut best_score = vocab_logits[unbiased] + own;
         for &(tok, x) in bonus.iter() {
             let tok = tok as usize;
             if tok == b.blank_id {
                 continue;
             }
             if let Some(&logit) = vocab_logits.get(tok) {
-                let score = logit + alpha * x;
+                let score = logit + x;
                 if score > best_score {
                     best = tok;
                     best_score = score;
@@ -419,8 +444,13 @@ mod tests {
         (v, blank)
     }
 
-    fn phrases(p: &[&str]) -> Vec<String> {
-        p.iter().map(|s| s.to_string()).collect()
+    /// Every phrase at `strength`.
+    fn phrases(p: &[&str], strength: f32) -> Vec<BoostPhrase> {
+        p.iter().map(|s| BoostPhrase::new(*s, strength)).collect()
+    }
+
+    fn texts(b: &PhraseBooster) -> Vec<&str> {
+        b.phrases().iter().map(|p| p.text.as_str()).collect()
     }
 
     #[test]
@@ -434,9 +464,9 @@ mod tests {
 ")).collect();
         std::fs::write(&path, text).unwrap();
         spell::fixture::tokenizer(&v, blank).save(&tok_path, false).unwrap();
-        let p = phrases(&["cairn", "Cairn", "ai"]);
-        let from_file = PhraseBooster::from_files(&path, &tok_path, &p, 2.0).unwrap();
-        let direct = booster_for(&v, blank, &p, 2.0);
+        let p = phrases(&["cairn", "Cairn", "ai"], 2.0);
+        let from_file = PhraseBooster::from_files(&path, &tok_path, &p).unwrap();
+        let direct = booster_for(&v, blank, &p);
         assert_eq!(from_file.vocab_fingerprint, direct.vocab_fingerprint);
         assert_eq!(from_file.vocab_len, direct.vocab_len);
         assert_eq!(from_file.blank_id, direct.blank_id, "blank is vocab size - 1 either way");
@@ -444,8 +474,8 @@ mod tests {
         assert_eq!(from_file.spellings("cairn"), direct.spellings("cairn"));
         assert_eq!(from_file.root_fan_out(), direct.root_fan_out());
         assert!(from_file.check_vocab(&v).is_ok());
-        assert!(PhraseBooster::from_files(&dir.join("missing.txt"), &tok_path, &p, 2.0).is_err());
-        assert!(PhraseBooster::from_files(&path, &dir.join("missing.json"), &p, 2.0).is_err());
+        assert!(PhraseBooster::from_files(&dir.join("missing.txt"), &tok_path, &p).is_err());
+        assert!(PhraseBooster::from_files(&path, &dir.join("missing.json"), &p).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -458,7 +488,7 @@ mod tests {
         let text: String = v.iter().enumerate().map(|(i, t)| format!("{t} {i}
 ")).collect();
         std::fs::write(&path, text).unwrap();
-        let b = PhraseBooster::from_files(&path, &dir.join("no-such-tokenizer.json"), &[], 2.0)
+        let b = PhraseBooster::from_files(&path, &dir.join("no-such-tokenizer.json"), &[])
             .unwrap();
         assert!(b.is_empty());
         assert_eq!(b.blank_id, blank);
@@ -469,8 +499,8 @@ mod tests {
         c.emitted(OFF);
         assert_eq!(c.finish().changed, vec![false]);
         // A non-empty list still needs the file.
-        let p = phrases(&["cairn"]);
-        assert!(PhraseBooster::from_files(&path, &dir.join("no-such-tokenizer.json"), &p, 2.0)
+        let p = phrases(&["cairn"], 2.0);
+        assert!(PhraseBooster::from_files(&path, &dir.join("no-such-tokenizer.json"), &p)
             .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -481,14 +511,15 @@ mod tests {
         assert_eq!(b.pieces(), vocab().0.as_slice());
     }
 
+    /// Every phrase at `strength`.
     fn booster(p: &[&str], strength: f32) -> PhraseBooster {
         let (v, b) = vocab();
-        booster_for(&v, b, &phrases(p), strength)
+        booster_for(&v, b, &phrases(p, strength))
     }
 
     /// A booster for `v` (blank `blank`), spelled by a fixture tokenizer for `v`.
-    fn booster_for(v: &[String], blank: usize, p: &[String], strength: f32) -> PhraseBooster {
-        PhraseBooster::new(v, blank, spell::fixture::tokenizer(v, blank), p, strength).unwrap()
+    fn booster_for(v: &[String], blank: usize, p: &[BoostPhrase]) -> PhraseBooster {
+        PhraseBooster::new(v, blank, spell::fixture::tokenizer(v, blank), p).unwrap()
     }
 
     /// Logits that are 0 everywhere except the listed tokens.
@@ -618,7 +649,7 @@ mod tests {
                 last: 2
             }]
         );
-        assert_eq!(b.phrases()[1], "cairn");
+        assert_eq!(b.phrases()[1].text, "cairn");
     }
 
     #[test]
@@ -627,7 +658,7 @@ mod tests {
             &["Cairn", "cairn", "Cairn", "  CAIRN ", "dogs", "dogs"],
             1.0,
         );
-        assert_eq!(b.phrases(), &["Cairn".to_string(), "dogs".to_string()]);
+        assert_eq!(texts(&b), ["Cairn", "dogs"]);
         assert!(b.skipped().is_empty());
         // `▁ca`, `▁Ca`, `▁dog`: each phrase start once
         assert_eq!(b.root_fan_out(), 3);
@@ -652,8 +683,9 @@ mod tests {
             .collect();
         let blank = v.len() - 1;
         let p = |s: &str| s.to_string();
-        let b = booster_for(&v, blank, &[p("dockbox"), p("DockBox")], 1.0);
-        assert_eq!(b.phrases(), &[p("dockbox")]);
+        let both = phrases(&["dockbox", "DockBox"], 1.0);
+        let b = booster_for(&v, blank, &both);
+        assert_eq!(texts(&b), ["dockbox"]);
         // `▁Dock Box` is only reachable through the second casing
         let want = vec![
             vec![p("▁dock"), p("box")],
@@ -678,8 +710,8 @@ mod tests {
             .iter()
             .map(|s| p(s))
             .collect();
-        let b = booster_for(&caps, 3, &[p("dockbox"), p("DockBox")], 1.0);
-        assert_eq!(b.phrases(), &[p("dockbox")]);
+        let b = booster_for(&caps, 3, &both);
+        assert_eq!(texts(&b), ["dockbox"]);
         assert!(b.skipped().is_empty());
         assert_eq!(b.spellings("dockbox"), vec![vec![p("▁Dock"), p("Box")]]);
     }
@@ -687,7 +719,7 @@ mod tests {
     #[test]
     fn skipped_phrases_are_kept_with_their_reason() {
         let b = booster(&["AI", "cairn", "zebra", "   ", "zebra"], 1.0);
-        assert_eq!(b.phrases(), &["cairn".to_string()]);
+        assert_eq!(texts(&b), ["cairn"]);
         assert_eq!(
             b.skipped(),
             &[
@@ -701,12 +733,37 @@ mod tests {
     }
 
     #[test]
-    fn strength_is_clamped() {
-        assert_eq!(booster(&["cairn"], 9.0).strength(), 5.0);
-        assert_eq!(booster(&["cairn"], -1.0).strength(), 0.0);
-        assert_eq!(booster(&["cairn"], 2.5).strength(), 2.5);
-        assert_eq!(booster(&["cairn"], f32::NAN).strength(), 0.0);
+    fn strength_is_clamped_and_zero_is_skipped() {
+        assert_eq!(booster(&["cairn"], 9.0).phrases()[0].strength, 5.0);
+        assert_eq!(booster(&["cairn"], 2.5).phrases()[0].strength, 2.5);
+        for nothing in [0.0, -1.0, f32::NAN] {
+            let b = booster(&["cairn"], nothing);
+            assert!(b.is_empty(), "{nothing}");
+            assert_eq!(b.skipped(), &[("cairn".to_string(), SkipReason::NoStrength)]);
+        }
+        // a spelling problem is the reason reported, whatever the strength
+        assert_eq!(booster(&["AI"], 0.0).skipped(), &[("AI".to_string(), SkipReason::TooShort)]);
         assert_eq!(PhraseBooster::MAX_STRENGTH, 5.0);
+    }
+
+    #[test]
+    fn each_phrase_is_boosted_at_its_own_strength() {
+        // `▁ca` (cairn, 1.0) and `▁dog` (dogs, 0.4) each 0.5 behind an off-tree
+        // token at the root: only the stronger phrase's start overtakes it.
+        let (v, blank) = vocab();
+        let p = [BoostPhrase::new("cairn", 1.0), BoostPhrase::new("dogs", 0.4)];
+        let b = booster_for(&v, blank, &p);
+        assert_eq!(b.cursor().pick(&logits(&[(OFF, 2.5), (CA, 2.0)])), CA);
+        assert_eq!(b.cursor().pick(&logits(&[(OFF, 2.5), (6, 2.0)])), OFF);
+        assert_eq!(b.phrases(), &p);
+    }
+
+    #[test]
+    fn case_duplicates_take_the_larger_strength() {
+        let (v, blank) = vocab();
+        let p = [BoostPhrase::new("cairn", 0.5), BoostPhrase::new("Cairn", 1.0)];
+        let b = booster_for(&v, blank, &p);
+        assert_eq!(b.phrases(), &[BoostPhrase::new("cairn", 1.0)]);
     }
 
     #[test]

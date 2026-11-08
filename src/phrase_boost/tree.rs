@@ -2,8 +2,10 @@
 //! scored like NeMo's boosting tree (research notes 1.1-1.3).
 //!
 //! Knows: node scores, fail links, backoff, the score of any token from any
-//! state, and which phrase a state has just completed. Does not know about
-//! the decoder, strengths or the vocabulary.
+//! state, and which phrase a state has just completed. Each sequence carries a
+//! weight (its phrase's boost strength) that scales the score of every token on
+//! its path, so a step bonus is already in nats. Does not know about the decoder
+//! or the vocabulary.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
@@ -13,11 +15,17 @@ pub(crate) const ROOT: NodeId = 0;
 
 /// Built once from the phrases' token sequences; immutable afterwards.
 ///
-/// `build` takes `(token sequence, phrase index)` pairs. Every query is a
-/// pure function of a `NodeId` state, so a decode needs only one `NodeId`.
-/// Scores follow NeMo: the token at 0-indexed depth `i` is worth `c0` when
-/// `i == 0` and `c0 * beta + ln(i + 1)` otherwise, a node's score is the sum
-/// along its path, and tokens with no arc on the fail chain score 0.
+/// `build` takes `(token sequence, phrase index, weight)` triples. Every query
+/// is a pure function of a `NodeId` state, so a decode needs only one `NodeId`.
+/// Scores follow NeMo, times a weight: the token at 0-indexed depth `i` is worth
+/// `w * c0` when `i == 0` and `w * (c0 * beta + ln(i + 1))` otherwise, where `w`
+/// is the node's weight; a node's score is the sum along its path, and tokens
+/// with no arc on the fail chain score 0.
+///
+/// A node's weight is the LARGEST weight of the sequences through it, so a
+/// prefix shared by a strong and a weak phrase is boosted as the strong one
+/// until they diverge. With every weight 1.0 the arithmetic is NeMo's exactly
+/// (`x * 1.0 == x`), and with every weight `w` each score is `w` times that.
 pub(crate) struct Tree {
     nodes: Vec<Node>,
     c0: f32,
@@ -31,6 +39,8 @@ struct Node {
     children: BTreeMap<u32, NodeId>,
     fail: NodeId,
     depth: u16,
+    /// The largest weight of the sequences through this node; 0 at the root.
+    weight: f32,
     score: f32,
     /// Phrase index when a phrase ends exactly here.
     end: Option<u32>,
@@ -48,18 +58,21 @@ fn token_score(c0: f32, beta: f32, i: u16) -> f32 {
 
 impl Tree {
     /// Empty sequences are ignored. When two sequences are identical, the
-    /// first one's phrase index is kept.
-    pub(crate) fn build(seqs: &[(Vec<u32>, u32)], c0: f32, beta: f32) -> Tree {
-        let new_node = |depth: u16, score: f32| Node {
+    /// first one's phrase index is kept (and the larger weight). Weights must
+    /// be finite and non-negative; the booster clamps them before this.
+    pub(crate) fn build(seqs: &[(Vec<u32>, u32, f32)], c0: f32, beta: f32) -> Tree {
+        let new_node = |depth: u16| Node {
             children: BTreeMap::new(),
             fail: ROOT,
             depth,
-            score,
+            weight: 0.0,
+            score: 0.0,
             end: None,
             output: None,
         };
-        let mut nodes = vec![new_node(0, 0.0)];
-        for (seq, phrase) in seqs {
+        let mut nodes = vec![new_node(0)];
+        for (seq, phrase, weight) in seqs {
+            debug_assert!(weight.is_finite() && *weight >= 0.0, "weight {weight}");
             if seq.is_empty() {
                 continue;
             }
@@ -69,13 +82,14 @@ impl Tree {
                     Some(&next) => next,
                     None => {
                         let depth = nodes[cur as usize].depth + 1;
-                        let score = nodes[cur as usize].score + token_score(c0, beta, depth - 1);
                         let id = nodes.len() as NodeId;
-                        nodes.push(new_node(depth, score));
+                        nodes.push(new_node(depth));
                         nodes[cur as usize].children.insert(tok, id);
                         id
                     }
                 };
+                let w = &mut nodes[cur as usize].weight;
+                *w = w.max(*weight);
             }
             nodes[cur as usize].end.get_or_insert(*phrase);
         }
@@ -84,6 +98,9 @@ impl Tree {
         // `order` is the BFS order of every non-root node.
         let mut order: Vec<NodeId> = Vec::with_capacity(nodes.len());
         let mut queue: VecDeque<NodeId> = nodes[ROOT as usize].children.values().copied().collect();
+        for &first in &queue {
+            nodes[first as usize].score = nodes[first as usize].weight * token_score(c0, beta, 0);
+        }
         while let Some(parent) = queue.pop_front() {
             order.push(parent);
             let kids: Vec<(u32, NodeId)> =
@@ -98,6 +115,11 @@ impl Tree {
                     }
                 };
                 nodes[child as usize].fail = fail;
+                // A parent's score is final before its children's (breadth-first).
+                let parent_score = nodes[parent as usize].score;
+                let arc = nodes[child as usize].weight
+                    * token_score(c0, beta, nodes[parent as usize].depth);
+                nodes[child as usize].score = parent_score + arc;
                 queue.push_back(child);
             }
         }
@@ -137,8 +159,8 @@ impl Tree {
         let mut acc = 0.0;
         let mut cur = s;
         loop {
-            if self.nodes[cur as usize].children.contains_key(&tok) {
-                return acc + self.arc_score(cur);
+            if let Some(&child) = self.nodes[cur as usize].children.get(&tok) {
+                return acc + self.arc_score(cur, child);
             }
             if cur == ROOT {
                 return acc;
@@ -194,10 +216,12 @@ impl Tree {
         })
     }
 
-    /// Score of any arc leaving `parent`: it depends only on the parent's
-    /// depth, which is the 0-indexed position of the token.
-    fn arc_score(&self, parent: NodeId) -> f32 {
-        token_score(self.c0, self.beta, self.nodes[parent as usize].depth)
+    /// Score of the arc `parent -> child`: the child's weight times the score
+    /// of a token at the parent's depth (the token's 0-indexed position).
+    /// Equal to `score(child) - score(parent)`, computed as `build` does.
+    fn arc_score(&self, parent: NodeId, child: NodeId) -> f32 {
+        self.nodes[child as usize].weight
+            * token_score(self.c0, self.beta, self.nodes[parent as usize].depth)
     }
 
     /// Zero at the root and at end nodes (a finished phrase keeps its bonus);
@@ -220,9 +244,9 @@ impl Tree {
         let mut out: Vec<(u32, f32)> = Vec::new();
         let mut acc = 0.0;
         for &n in &chain {
-            for &tok in self.nodes[n as usize].children.keys() {
+            for (&tok, &child) in &self.nodes[n as usize].children {
                 if !out.iter().any(|(t, _)| *t == tok) {
-                    out.push((tok, acc + self.arc_score(n) - base));
+                    out.push((tok, acc + self.arc_score(n, child) - base));
                 }
             }
             acc += self.backoff(n);
@@ -242,7 +266,7 @@ mod tests {
     }
 
     fn fixture() -> Tree {
-        Tree::build(&[(vec![1, 2, 3], 0), (vec![1, 2, 4], 1), (vec![3], 2)], 1.0, 1.0)
+        Tree::build(&[(vec![1, 2, 3], 0, 1.0), (vec![1, 2, 4], 1, 1.0), (vec![3], 2, 1.0)], 1.0, 1.0)
     }
 
     /// Per-token boost along a decoded sequence, following the automaton.
@@ -287,7 +311,7 @@ mod tests {
 
     #[test]
     fn default_depth_scores() {
-        let t = Tree::build(&[(vec![1, 2, 3, 4, 5], 0)], 1.0, 2.0);
+        let t = Tree::build(&[(vec![1, 2, 3, 4, 5], 0, 1.0)], 1.0, 2.0);
         let want = [1.0, 3.6931, 6.7918, 10.1781, 13.7875];
         for (i, w) in want.iter().enumerate() {
             let n = t.node_for(&[1, 2, 3, 4, 5][..=i]);
@@ -298,7 +322,7 @@ mod tests {
     #[test]
     fn depth_scores_scale_with_c0() {
         // c0 = 2: the first token is worth c0, every later one c0 * beta + ln(i + 1)
-        let t = Tree::build(&[(vec![1, 2, 3], 0)], 2.0, 2.0);
+        let t = Tree::build(&[(vec![1, 2, 3], 0, 1.0)], 2.0, 2.0);
         let want = [2.0, 2.0 + 4.0 + 2f32.ln(), 2.0 + 8.0 + 2f32.ln() + 3f32.ln()];
         for (i, w) in want.iter().enumerate() {
             let n = t.node_for(&[1, 2, 3][..=i]);
@@ -310,7 +334,7 @@ mod tests {
     #[test]
     fn relative_bonus_equals_brute_force() {
         let t = Tree::build(
-            &[(vec![1, 2, 3], 0), (vec![1, 2, 4], 1), (vec![3], 2), (vec![2, 3, 1], 3)],
+            &[(vec![1, 2, 3], 0, 1.0), (vec![1, 2, 4], 1, 1.0), (vec![3], 2, 1.0), (vec![2, 3, 1], 3, 1.0)],
             1.0,
             2.0,
         );
@@ -343,7 +367,7 @@ mod tests {
 
     #[test]
     fn completed_reports_suffix_phrases() {
-        let t = Tree::build(&[(vec![1, 2, 3, 4], 0), (vec![2, 3], 1)], 1.0, 2.0);
+        let t = Tree::build(&[(vec![1, 2, 3, 4], 0, 1.0), (vec![2, 3], 1, 1.0)], 1.0, 2.0);
         let mut s = ROOT;
         let mut last = None;
         for v in [1, 2, 3] {
@@ -358,7 +382,63 @@ mod tests {
 
     #[test]
     fn duplicate_sequences_keep_the_first_phrase() {
-        let t = Tree::build(&[(vec![1, 2], 7), (vec![1, 2], 9)], 1.0, 2.0);
+        let t = Tree::build(&[(vec![1, 2], 7, 1.0), (vec![1, 2], 9, 1.0)], 1.0, 2.0);
         assert_eq!(t.completed(t.node_for(&[1, 2])), Some((7, 2)));
+    }
+
+    #[test]
+    fn a_uniform_weight_scales_every_bonus_exactly() {
+        // 0.5 is a power of two, so scaling is exact: the booster at 0.5 for
+        // every phrase must equal the old global strength 0.5 bit for bit.
+        let seqs = |w: f32| -> Vec<(Vec<u32>, u32, f32)> {
+            vec![(vec![1, 2, 3], 0, w), (vec![1, 2, 4], 1, w), (vec![3], 2, w), (vec![2, 3, 1], 3, w)]
+        };
+        let one = Tree::build(&seqs(1.0), 1.0, 2.0);
+        let half = Tree::build(&seqs(0.5), 1.0, 2.0);
+        assert_eq!(one.nodes.len(), half.nodes.len());
+        for s in 0..one.nodes.len() as NodeId {
+            let (a, b) = (one.step_bonus(s), half.step_bonus(s));
+            assert_eq!(a.len(), b.len());
+            for (&(ta, xa), &(tb, xb)) in a.iter().zip(b.iter()) {
+                assert_eq!(ta, tb);
+                assert_eq!((0.5 * xa).to_bits(), xb.to_bits(), "s={s} tok={ta}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_shared_prefix_takes_the_stronger_weight() {
+        // 1 2 3 at 1.0 and 1 2 4 at 0.5 share `1 2`: boosted at 1.0 until they part.
+        let t = Tree::build(&[(vec![1, 2, 3], 0, 1.0), (vec![1, 2, 4], 1, 0.5)], 1.0, 2.0);
+        let full = Tree::build(&[(vec![1, 2, 3], 0, 1.0)], 1.0, 2.0);
+        let ab = t.node_for(&[1, 2]);
+        assert_eq!(t.node_score(ab).to_bits(), full.node_score(full.node_for(&[1, 2])).to_bits());
+        let arc = |n: &[u32]| t.node_score(t.node_for(n)) - t.node_score(ab);
+        assert!(close(arc(&[1, 2, 3]), 2.0 + 3f32.ln()));
+        assert!(close(arc(&[1, 2, 4]), 0.5 * (2.0 + 3f32.ln())));
+    }
+
+    #[test]
+    fn a_weak_phrase_alone_is_boosted_at_its_own_weight() {
+        let t = Tree::build(&[(vec![1, 2], 0, 1.0), (vec![3, 4], 1, 0.5)], 1.0, 2.0);
+        assert!(close(t.score(ROOT, 1), 1.0));
+        assert!(close(t.score(ROOT, 3), 0.5));
+    }
+
+    #[test]
+    fn relative_bonus_equals_brute_force_with_mixed_weights() {
+        let t = Tree::build(
+            &[(vec![1, 2, 3], 0, 1.0), (vec![1, 2, 4], 1, 0.5), (vec![3], 2, 0.25), (vec![2, 3, 1], 3, 2.0)],
+            1.0,
+            2.0,
+        );
+        for s in 0..t.nodes.len() as NodeId {
+            let base = t.score(s, 5);
+            let bonus = t.step_bonus(s);
+            for v in 0..6u32 {
+                let b = bonus.iter().find(|(tok, _)| *tok == v).map_or(0.0, |(_, x)| *x);
+                assert!(close(b, t.score(s, v) - base), "s={s} v={v} b={b}");
+            }
+        }
     }
 }

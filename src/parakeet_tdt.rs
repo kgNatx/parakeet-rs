@@ -5,7 +5,7 @@ use crate::decoder_tdt::{token_start_seconds, ParakeetTDTDecoder};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_tdt::{Decoded, EncoderStates, ParakeetTDTModel};
-use crate::phrase_boost::{BoostHit, BoostOutcome, PhraseBooster};
+use crate::phrase_boost::{BoostHit, BoostOutcome, BoostPhrase, PhraseBooster};
 use crate::timestamps::{process_timestamps, TimestampMode};
 use crate::transcriber::Transcriber;
 use crate::vocab::Vocabulary;
@@ -113,18 +113,17 @@ impl ParakeetTDT {
         Ok((result, states.expect("encoder states requested")))
     }
 
-    /// Compile `phrases` into a booster for this model's vocabulary at `strength` (clamped to
-    /// `[0, PhraseBooster::MAX_STRENGTH]`), spelling each phrase with the model's canonical
+    /// Compile `phrases` into a booster for this model's vocabulary, each at its own strength
+    /// (clamped to `[0, PhraseBooster::MAX_STRENGTH]`), spelling each phrase with the model's canonical
     /// `tokenizer.json` at `tokenizer` (NVIDIA publishes it beside the model). Build once,
     /// reuse across calls. A tokenizer for another vocabulary is an `Error::Config`.
     /// Phrases it cannot boost are listed in [`PhraseBooster::skipped`] with their reason.
     pub fn phrase_booster(
         &self,
-        phrases: &[String],
-        strength: f32,
+        phrases: &[BoostPhrase],
         tokenizer: &Path,
     ) -> Result<PhraseBooster> {
-        PhraseBooster::from_vocabulary(self.decoder.vocab(), tokenizer, phrases, strength)
+        PhraseBooster::from_vocabulary(self.decoder.vocab(), tokenizer, phrases)
     }
 
     /// [`transcribe_samples_with_encoder`](Self::transcribe_samples_with_encoder), with the greedy
@@ -259,7 +258,7 @@ fn boost_outcome(
         .hits
         .iter()
         .map(|h| BoostHit {
-            phrase: b.phrases()[h.phrase as usize].clone(),
+            phrase: b.phrases()[h.phrase as usize].text.clone(),
             start: at(h.first),
             end: at(h.last) + seconds_per_frame,
             changed: trace.changed[h.first..=h.last].iter().any(|&c| c),
@@ -293,9 +292,9 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let p: Vec<String> = ["dogs", "cairn"].iter().map(|s| s.to_string()).collect();
+        let p: Vec<BoostPhrase> = ["dogs", "cairn"].iter().map(|s| BoostPhrase::new(*s, 1.0)).collect();
         let t = crate::phrase_boost::fixture_tokenizer(&v, 6);
-        PhraseBooster::new(&v, 6, t, &p, 1.0).unwrap()
+        PhraseBooster::new(&v, 6, t, &p).unwrap()
     }
 
     fn decoded(trace: Option<BoostTrace>) -> Decoded {
