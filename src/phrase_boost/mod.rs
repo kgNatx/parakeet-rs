@@ -6,13 +6,17 @@
 mod spell;
 mod tree;
 
+#[cfg(test)]
+pub(crate) use spell::fixture::tokenizer as fixture_tokenizer;
+
 use crate::error::{Error, Result};
 use crate::vocab::Vocabulary;
-use std::path::Path;
 use crate::model_tdt::argmax_last;
 use spell::Speller;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::path::Path;
+use tokenizers::Tokenizer;
 use tree::{NodeId, Tree, ROOT};
 
 /// Why a phrase was left out of the boost list. Never fatal: the caller logs it.
@@ -20,7 +24,8 @@ use tree::{NodeId, Tree, ROOT};
 pub enum SkipReason {
     /// Two letters or fewer: too ambiguous to boost.
     TooShort,
-    /// The vocab cannot spell it (a character with no piece).
+    /// The tokenizer cannot spell it in the model's pieces: its encoding needs
+    /// `<unk>`, a byte-fallback piece or another `<…>` piece.
     NotSpellable,
 }
 
@@ -75,13 +80,16 @@ impl PhraseBooster {
     pub const MAX_STRENGTH: f32 = 5.0;
 
     /// `strength` is clamped to `[0, MAX_STRENGTH]`; NaN counts as 0 (no boost).
+    /// `tokenizer` spells the phrases and must hold exactly `id_to_token`'s
+    /// pieces, blank excepted, at the same ids (`Error::Config` otherwise).
     pub(crate) fn new(
         id_to_token: &[String],
         blank_id: usize,
+        tokenizer: Tokenizer,
         phrases: &[String],
         strength: f32,
-    ) -> PhraseBooster {
-        let speller = Speller::new(id_to_token, blank_id);
+    ) -> Result<PhraseBooster> {
+        let speller = Speller::new(tokenizer, id_to_token, blank_id)?;
         // One entry per case-insensitive key, named by its first casing; every
         // casing given contributes its spellings (an as-written variant can
         // reach pieces the others cannot).
@@ -136,7 +144,7 @@ impl PhraseBooster {
         } else {
             strength.clamp(0.0, Self::MAX_STRENGTH)
         };
-        PhraseBooster {
+        Ok(PhraseBooster {
             phrases: kept,
             spellings,
             skipped,
@@ -146,20 +154,34 @@ impl PhraseBooster {
             vocab_len: id_to_token.len(),
             vocab_fingerprint: fingerprint(id_to_token),
             pieces: id_to_token.to_vec(),
-        }
+        })
     }
 
-    /// Compile `phrases` for `vocab`. The ONE place the blank id is defined: the decode loop's
-    /// blank is `vocab_size - 1`, and the model's `vocab_size` is `vocab.size()`.
-    pub(crate) fn from_vocabulary(vocab: &Vocabulary, phrases: &[String], strength: f32) -> PhraseBooster {
+    /// Compile `phrases` for `vocab`, spelled by the `tokenizer.json` at `tokenizer`. The ONE
+    /// place the blank id is defined: the decode loop's blank is `vocab_size - 1`, and the
+    /// model's `vocab_size` is `vocab.size()`.
+    pub(crate) fn from_vocabulary(
+        vocab: &Vocabulary,
+        tokenizer: &Path,
+        phrases: &[String],
+        strength: f32,
+    ) -> Result<PhraseBooster> {
         let blank_id = vocab.size().saturating_sub(1);
-        PhraseBooster::new(&vocab.id_to_token, blank_id, phrases, strength)
+        let tokenizer = spell::load_tokenizer(tokenizer)?;
+        PhraseBooster::new(&vocab.id_to_token, blank_id, tokenizer, phrases, strength)
     }
 
-    /// Compile `phrases` for the vocabulary in a model dir's `vocab.txt`, without loading any
-    /// model. The result equals `ParakeetTDT::phrase_booster` for the same vocabulary.
-    pub fn from_vocab_file(path: &Path, phrases: &[String], strength: f32) -> Result<PhraseBooster> {
-        Ok(Self::from_vocabulary(&Vocabulary::from_file(path)?, phrases, strength))
+    /// Compile `phrases` for the vocabulary in a model dir's `vocab.txt`, spelled by the
+    /// model's canonical `tokenizer.json`, without loading any model. The result equals
+    /// `ParakeetTDT::phrase_booster` for the same files. A tokenizer whose pieces are not the
+    /// vocabulary's (blank excepted) is an `Error::Config` naming the first mismatch.
+    pub fn from_files(
+        vocab: &Path,
+        tokenizer: &Path,
+        phrases: &[String],
+        strength: f32,
+    ) -> Result<PhraseBooster> {
+        Self::from_vocabulary(&Vocabulary::from_file(vocab)?, tokenizer, phrases, strength)
     }
 
     /// The vocabulary this booster was built for, `id -> piece`.
@@ -389,14 +411,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pb-vocab-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("vocab.txt");
-        let (v, _) = vocab();
+        let tok_path = dir.join("tokenizer.json");
+        let (v, blank) = vocab();
         let text: String = v.iter().enumerate().map(|(i, t)| format!("{t} {i}
 ")).collect();
         std::fs::write(&path, text).unwrap();
+        spell::fixture::tokenizer(&v, blank).save(&tok_path, false).unwrap();
         let p = phrases(&["cairn", "Cairn", "ai"]);
-        let from_file = PhraseBooster::from_vocab_file(&path, &p, 2.0).unwrap();
-        let (v, blank) = vocab();
-        let direct = PhraseBooster::new(&v, blank, &p, 2.0);
+        let from_file = PhraseBooster::from_files(&path, &tok_path, &p, 2.0).unwrap();
+        let direct = booster_for(&v, blank, &p, 2.0);
         assert_eq!(from_file.vocab_fingerprint, direct.vocab_fingerprint);
         assert_eq!(from_file.vocab_len, direct.vocab_len);
         assert_eq!(from_file.blank_id, direct.blank_id, "blank is vocab size - 1 either way");
@@ -404,7 +427,8 @@ mod tests {
         assert_eq!(from_file.spellings("cairn"), direct.spellings("cairn"));
         assert_eq!(from_file.root_fan_out(), direct.root_fan_out());
         assert!(from_file.check_vocab(&v).is_ok());
-        assert!(PhraseBooster::from_vocab_file(&dir.join("missing.txt"), &p, 2.0).is_err());
+        assert!(PhraseBooster::from_files(&dir.join("missing.txt"), &tok_path, &p, 2.0).is_err());
+        assert!(PhraseBooster::from_files(&path, &dir.join("missing.json"), &p, 2.0).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -416,7 +440,12 @@ mod tests {
 
     fn booster(p: &[&str], strength: f32) -> PhraseBooster {
         let (v, b) = vocab();
-        PhraseBooster::new(&v, b, &phrases(p), strength)
+        booster_for(&v, b, &phrases(p), strength)
+    }
+
+    /// A booster for `v` (blank `blank`), spelled by a fixture tokenizer for `v`.
+    fn booster_for(v: &[String], blank: usize, p: &[String], strength: f32) -> PhraseBooster {
+        PhraseBooster::new(v, blank, spell::fixture::tokenizer(v, blank), p, strength).unwrap()
     }
 
     /// Logits that are 0 everywhere except the listed tokens.
@@ -580,7 +609,7 @@ mod tests {
             .collect();
         let blank = v.len() - 1;
         let p = |s: &str| s.to_string();
-        let b = PhraseBooster::new(&v, blank, &[p("dockbox"), p("DockBox")], 1.0);
+        let b = booster_for(&v, blank, &[p("dockbox"), p("DockBox")], 1.0);
         assert_eq!(b.phrases(), &[p("dockbox")]);
         // `▁Dock Box` is only reachable through the second casing
         let want = vec![
@@ -606,7 +635,7 @@ mod tests {
             .iter()
             .map(|s| p(s))
             .collect();
-        let b = PhraseBooster::new(&caps, 3, &[p("dockbox"), p("DockBox")], 1.0);
+        let b = booster_for(&caps, 3, &[p("dockbox"), p("DockBox")], 1.0);
         assert_eq!(b.phrases(), &[p("dockbox")]);
         assert!(b.skipped().is_empty());
         assert_eq!(b.spellings("dockbox"), vec![vec![p("▁Dock"), p("Box")]]);

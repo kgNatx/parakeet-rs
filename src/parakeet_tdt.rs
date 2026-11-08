@@ -114,10 +114,17 @@ impl ParakeetTDT {
     }
 
     /// Compile `phrases` into a booster for this model's vocabulary at `strength` (clamped to
-    /// `[0, PhraseBooster::MAX_STRENGTH]`). About a millisecond; build once, reuse across calls.
+    /// `[0, PhraseBooster::MAX_STRENGTH]`), spelling each phrase with the model's canonical
+    /// `tokenizer.json` at `tokenizer` (NVIDIA publishes it beside the model). Build once,
+    /// reuse across calls. A tokenizer for another vocabulary is an `Error::Config`.
     /// Phrases it cannot boost are listed in [`PhraseBooster::skipped`] with their reason.
-    pub fn phrase_booster(&self, phrases: &[String], strength: f32) -> PhraseBooster {
-        PhraseBooster::from_vocabulary(self.decoder.vocab(), phrases, strength)
+    pub fn phrase_booster(
+        &self,
+        phrases: &[String],
+        strength: f32,
+        tokenizer: &Path,
+    ) -> Result<PhraseBooster> {
+        PhraseBooster::from_vocabulary(self.decoder.vocab(), tokenizer, phrases, strength)
     }
 
     /// [`transcribe_samples_with_encoder`](Self::transcribe_samples_with_encoder), with the greedy
@@ -287,7 +294,8 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let p: Vec<String> = ["dogs", "cairn"].iter().map(|s| s.to_string()).collect();
-        PhraseBooster::new(&v, 6, &p, 1.0)
+        let t = crate::phrase_boost::fixture_tokenizer(&v, 6);
+        PhraseBooster::new(&v, 6, t, &p, 1.0).unwrap()
     }
 
     fn decoded(trace: Option<BoostTrace>) -> Decoded {

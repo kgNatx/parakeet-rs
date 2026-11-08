@@ -1,44 +1,78 @@
 //! Spelling a phrase in the model's vocab pieces.
 
 use super::SkipReason;
-use std::collections::HashMap;
+use crate::error::{Error, Result};
+use std::path::Path;
+use tokenizers::Tokenizer;
 
-pub(crate) const MAX_SPELLINGS_PER_VARIANT: usize = 5;
 pub(crate) const MIN_LETTERS: usize = 3;
 
-const WORD_START: char = '\u{2581}'; // ▁
+/// Loads a `tokenizer.json`.
+pub(crate) fn load_tokenizer(path: &Path) -> Result<Tokenizer> {
+    Tokenizer::from_file(path).map_err(|e| {
+        Error::Tokenizer(format!("failed to load tokenizer {}: {e}", path.display()))
+    })
+}
 
-/// Every token sequence the decoder could emit for `phrase` starting a word: for
-/// each case variant (as written, all lowercase, first letter uppercased), the
-/// segmentations of `▁` + words-joined-by-`▁` into vocab pieces that use the
-/// fewest pieces, at most 5 per variant, ordered by token ids, deduplicated
-/// across variants. Letters are alphanumeric characters; `TooShort` when there
-/// are ≤ 2 of them (so a whitespace-only phrase is always `TooShort`); otherwise
-/// `NotSpellable` when no variant segments. Whitespace is trimmed and runs
-/// collapse to one word boundary. Punctuation is spelled like any other
-/// character, including a bare `▁` piece before a leading `.`.
+/// Spells a phrase as the token ids the decoder would emit for it starting a
+/// word: the model's canonical tokenizer encoding (as NeMo spells boosted
+/// phrases), once per case variant (as written, all lowercase, first letter
+/// uppercased), sorted by token ids and deduplicated, so at most three.
+/// Letters are alphanumeric characters; `TooShort` when there are ≤ 2 of them
+/// (so a whitespace-only phrase is always `TooShort`). A variant whose encoding
+/// is empty or holds the blank or any `<…>` piece (`<unk>`, byte fallback, a
+/// control token) is no spelling; `NotSpellable` when no variant spells.
+/// Whitespace is trimmed and runs collapse to one space before encoding.
 pub(crate) struct Speller {
-    pieces: HashMap<String, u32>,
-    max_piece_chars: usize,
+    tokenizer: Tokenizer,
+    /// Per token id: may this piece appear in a spelling?
+    usable: Vec<bool>,
 }
 
 impl Speller {
-    /// Builds the piece map. The blank and every `<…>` piece are never used.
-    pub(crate) fn new(id_to_token: &[String], blank_id: usize) -> Speller {
-        let mut pieces = HashMap::new();
-        let mut max_piece_chars = 0;
-        for (id, tok) in id_to_token.iter().enumerate() {
-            let special = tok.chars().count() >= 2 && tok.starts_with('<') && tok.ends_with('>');
-            if id == blank_id || tok.is_empty() || special {
-                continue;
-            }
-            max_piece_chars = max_piece_chars.max(tok.chars().count());
-            pieces.entry(tok.clone()).or_insert(id as u32);
+    /// `Err(Error::Config)` naming the first mismatching id unless `tokenizer`
+    /// holds exactly `id_to_token`'s pieces at the same ids. The blank's id is
+    /// exempt: NVIDIA's tokenizer names it `<blank>` where `vocab.txt` says
+    /// `<blk>`, and a spelling never uses it.
+    pub(crate) fn new(
+        tokenizer: Tokenizer,
+        id_to_token: &[String],
+        blank_id: usize,
+    ) -> Result<Speller> {
+        let end = tokenizer
+            .get_vocab(true)
+            .into_values()
+            .map(|id| id as usize + 1)
+            .chain([id_to_token.len()])
+            .max()
+            .unwrap_or(0);
+        let mismatch = (0..end).filter(|&id| id != blank_id).find_map(|id| {
+            let in_tokenizer = tokenizer.id_to_token(id as u32);
+            let in_model = id_to_token.get(id).cloned();
+            (in_tokenizer != in_model).then_some((id, in_tokenizer, in_model))
+        });
+        if let Some((id, in_tokenizer, in_model)) = mismatch {
+            let show = |p: Option<String>| p.map_or("absent".to_string(), |p| format!("{p:?}"));
+            return Err(Error::Config(format!(
+                "tokenizer does not match the model vocabulary: id {id} is {} in the \
+                 tokenizer but {} in the model",
+                show(in_tokenizer),
+                show(in_model),
+            )));
         }
-        Speller { pieces, max_piece_chars }
+        let usable = id_to_token
+            .iter()
+            .enumerate()
+            .map(|(id, tok)| {
+                let special =
+                    tok.chars().count() >= 2 && tok.starts_with('<') && tok.ends_with('>');
+                id != blank_id && !tok.is_empty() && !special
+            })
+            .collect();
+        Ok(Speller { tokenizer, usable })
     }
 
-    pub(crate) fn spell(&self, phrase: &str) -> Result<Vec<Vec<u32>>, SkipReason> {
+    pub(crate) fn spell(&self, phrase: &str) -> std::result::Result<Vec<Vec<u32>>, SkipReason> {
         let words: Vec<&str> = phrase.split_whitespace().collect();
         let letters = words
             .iter()
@@ -48,7 +82,7 @@ impl Speller {
         if letters < MIN_LETTERS {
             return Err(SkipReason::TooShort);
         }
-        let joined = words.join(&WORD_START.to_string());
+        let joined = words.join(" ");
 
         let lower = joined.to_lowercase();
         let mut first_upper = String::new();
@@ -58,16 +92,10 @@ impl Speller {
             first_upper.push_str(chars.as_str());
         }
 
-        let mut out: Vec<Vec<u32>> = Vec::new();
-        let mut seen_variants: Vec<String> = Vec::new();
-        for variant in [joined, lower, first_upper] {
-            if seen_variants.contains(&variant) {
-                continue;
-            }
-            let target: Vec<char> = std::iter::once(WORD_START).chain(variant.chars()).collect();
-            out.extend(self.fewest_pieces(&target));
-            seen_variants.push(variant);
-        }
+        let mut out: Vec<Vec<u32>> = [joined, lower, first_upper]
+            .iter()
+            .filter_map(|variant| self.encode(variant))
+            .collect();
         out.sort();
         out.dedup();
         if out.is_empty() {
@@ -77,63 +105,51 @@ impl Speller {
         }
     }
 
-    /// Up to MAX_SPELLINGS_PER_VARIANT minimum-piece segmentations, in id order.
-    fn fewest_pieces(&self, target: &[char]) -> Vec<Vec<u32>> {
-        let n = target.len();
-        // moves[i]: (piece id, next position) for every piece starting at i.
-        let mut moves: Vec<Vec<(u32, usize)>> = vec![Vec::new(); n];
-        for (i, m) in moves.iter_mut().enumerate() {
-            for len in 1..=self.max_piece_chars.min(n - i) {
-                let s: String = target[i..i + len].iter().collect();
-                if let Some(&id) = self.pieces.get(&s) {
-                    m.push((id, i + len));
-                }
-            }
-            m.sort();
-        }
-        // best[i]: fewest pieces covering target[i..]; None if impossible.
-        let mut best: Vec<Option<usize>> = vec![None; n + 1];
-        best[n] = Some(0);
-        for i in (0..n).rev() {
-            best[i] = moves[i]
-                .iter()
-                .filter_map(|&(_, j)| best[j].map(|b| b + 1))
-                .min();
-        }
-        let mut found = Vec::new();
-        if best[0].is_some() {
-            let mut path = Vec::new();
-            Self::walk(0, n, &moves, &best, &mut path, &mut found);
-        }
-        found
+    /// The canonical encoding of `text`, if every piece of it is usable.
+    fn encode(&self, text: &str) -> Option<Vec<u32>> {
+        let ids = self.tokenizer.encode(text, false).ok()?.get_ids().to_vec();
+        let usable = |&id: &u32| self.usable.get(id as usize).copied().unwrap_or(false);
+        (!ids.is_empty() && ids.iter().all(usable)).then_some(ids)
     }
+}
 
-    fn walk(
-        i: usize,
-        n: usize,
-        moves: &[Vec<(u32, usize)>],
-        best: &[Option<usize>],
-        path: &mut Vec<u32>,
-        found: &mut Vec<Vec<u32>>,
-    ) {
-        if found.len() >= MAX_SPELLINGS_PER_VARIANT {
-            return;
-        }
-        if i == n {
-            found.push(path.clone());
-            return;
-        }
-        let want = best[i].map(|b| b - 1);
-        for &(id, j) in &moves[i] {
-            if best[j] == want {
-                path.push(id);
-                Self::walk(j, n, moves, best, path, found);
-                path.pop();
-                if found.len() >= MAX_SPELLINGS_PER_VARIANT {
-                    return;
-                }
+/// Test fixtures: a tokenizer for a tiny vocabulary.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use std::str::FromStr;
+    use tokenizers::Tokenizer;
+
+    /// A tokenizer whose pieces are exactly `id_to_token` without the blank, at
+    /// the same ids: Metaspace (`▁`, prepended always, split on spaces) like the
+    /// real one, but a greedy longest-prefix model (WordPiece with no
+    /// continuation prefix), so a test vocabulary needs no merge pieces. A word
+    /// with a character no piece covers encodes as `<unk>`.
+    pub(crate) fn tokenizer(id_to_token: &[String], blank_id: usize) -> Tokenizer {
+        let vocab: serde_json::Map<String, serde_json::Value> = id_to_token
+            .iter()
+            .enumerate()
+            .filter(|&(id, _)| id != blank_id)
+            .map(|(id, piece)| (piece.clone(), serde_json::Value::from(id)))
+            .collect();
+        let json = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {
+                "type": "Metaspace", "replacement": "\u{2581}",
+                "prepend_scheme": "always", "split": true
+            },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordPiece", "unk_token": "<unk>",
+                "continuing_subword_prefix": "", "max_input_chars_per_word": 100,
+                "vocab": vocab
             }
-        }
+        });
+        Tokenizer::from_str(&json.to_string()).expect("fixture tokenizer")
     }
 }
 
@@ -141,14 +157,22 @@ impl Speller {
 mod tests {
     use super::*;
 
+    const REAL_VOCAB: &str =
+        r"C:\Users\geisl\AppData\Roaming\speakey\app\data\models\parakeet-tdt-v3\vocab.txt";
+    const REAL_TOKENIZER: &str = r"E:\speech-eval\tokenizer-nvidia-v3\tokenizer.json";
+
     fn vocab(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    fn fixture() -> (Vec<String>, usize) {
+    fn speller(v: &[String], blank: usize) -> Speller {
+        Speller::new(fixture::tokenizer(v, blank), v, blank).unwrap()
+    }
+
+    fn small() -> (Vec<String>, usize) {
         let v = vocab(&[
             "<unk>", "▁C", "▁Ca", "a", "i", "r", "n", "rn", "irn", "▁c", "▁ca", "ir", "▁New",
-            "▁York", "▁", ".", "-", "cl", "aude", "env", "<blk>",
+            "▁York", "<blk>",
         ]);
         let blank = v.len() - 1;
         (v, blank)
@@ -158,22 +182,119 @@ mod tests {
         v.iter().position(|t| t == s).unwrap() as u32
     }
 
+    /// The real model vocabulary and NVIDIA's tokenizer for it, when both are present.
+    fn real() -> Option<(Vec<String>, usize, Speller)> {
+        let (vp, tp) = (Path::new(REAL_VOCAB), Path::new(REAL_TOKENIZER));
+        if !vp.exists() || !tp.exists() {
+            eprintln!("skipped: needs {REAL_VOCAB} and {REAL_TOKENIZER}");
+            return None;
+        }
+        let v = crate::vocab::Vocabulary::from_file(vp).unwrap().id_to_token;
+        let blank = v.len() - 1;
+        let sp = Speller::new(load_tokenizer(tp).unwrap(), &v, blank).unwrap();
+        Some((v, blank, sp))
+    }
+
+    fn as_pieces(v: &[String], spellings: &[Vec<u32>]) -> Vec<String> {
+        spellings
+            .iter()
+            .map(|s| s.iter().map(|&t| v[t as usize].as_str()).collect::<Vec<_>>().join("|"))
+            .collect()
+    }
+
+    /// Values from the 2026-11-07 Python check against the real tokenizer.json:
+    /// the canonical BPE encoding, not the fewest pieces (`▁bel|ly`).
     #[test]
-    fn the_fewest_pieces_win() {
-        let (v, b) = fixture();
-        let got = Speller::new(&v, b).spell("Cairn").unwrap();
-        let want = vec![
-            vec![id(&v, "▁Ca"), id(&v, "irn")],
-            vec![id(&v, "▁ca"), id(&v, "irn")],
-        ];
-        assert_eq!(got, want);
+    fn phrases_spell_as_the_canonical_tokenizer_encodes_them() {
+        let Some((v, _, sp)) = real() else { return };
+        for (phrase, want) in [
+            ("belly", "▁b|ell|y"),
+            ("chapel", "▁ch|ap|el"),
+            ("kneeling", "▁k|ne|el|ing"),
+            ("Covalex", "▁C|ov|ale|x"),
+            ("dockbox-prod", "▁do|ck|bo|x|-|pro|d"),
+            (".claude", "▁|.|c|la|ude"),
+        ] {
+            let got = as_pieces(&v, &sp.spell(phrase).unwrap());
+            assert!(got.iter().any(|s| s == want), "{phrase}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn one_spelling_per_case_variant_deduplicated() {
+        let Some((v, _, sp)) = real() else { return };
+        // As written, lowercase and first-upper: `Covalex` is its own first-upper form.
+        let got = as_pieces(&v, &sp.spell("Covalex").unwrap());
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.contains(&"▁C|ov|ale|x".to_string()), "{got:?}");
+        // All three variants coincide for a lowercase word whose first-upper form
+        // encodes differently; never more than three spellings.
+        for p in ["belly", "BELLY", "Belly", "dockbox-prod", "New York"] {
+            let got = sp.spell(p).unwrap();
+            assert!((1..=3).contains(&got.len()), "{p}: {got:?}");
+            let mut d = got.clone();
+            d.dedup();
+            assert_eq!(d, got, "{p}");
+        }
+        // Casings of one phrase spell to the same set.
+        assert_eq!(sp.spell("belly").unwrap(), sp.spell("Belly").unwrap());
+    }
+
+    #[test]
+    fn a_phrase_needing_byte_fallback_or_unk_is_not_spellable() {
+        let Some((_, _, sp)) = real() else { return };
+        for p in ["abc🙂", "東京都", "<unk>", "<|endoftext|>"] {
+            assert_eq!(sp.spell(p), Err(SkipReason::NotSpellable), "{p}");
+        }
+    }
+
+    #[test]
+    fn the_real_tokenizer_matches_the_real_vocab() {
+        let Some((v, blank, _)) = real() else { return };
+        assert_eq!(v[blank], "<blk>");
+    }
+
+    #[test]
+    fn a_tokenizer_for_another_vocabulary_is_refused() {
+        let (v, blank) = small();
+        let t = fixture::tokenizer(&v, blank);
+        // One piece renamed, same size: the error names it.
+        let mut renamed = v.clone();
+        renamed[4] = "o".to_string();
+        let err = Speller::new(t.clone(), &renamed, blank).err().expect("refused");
+        let msg = err.to_string();
+        assert!(msg.contains("id 4") && msg.contains("\"i\"") && msg.contains("\"o\""), "{msg}");
+        // A model vocabulary with a piece the tokenizer lacks.
+        let mut longer = v.clone();
+        longer.insert(blank, "z".to_string());
+        assert!(Speller::new(t.clone(), &longer, blank + 1).is_err());
+        // A tokenizer with a piece past the model's end.
+        let with_extra = fixture::tokenizer(&v, usize::MAX); // `<blk>` as an ordinary piece
+        let err = Speller::new(with_extra, &v[..blank], usize::MAX).err().expect("refused");
+        assert!(err.to_string().contains(&format!("id {blank} is \"<blk>\"")), "{err}");
+        assert!(err.to_string().contains("absent in the model"), "{err}");
+        // The blank's id is exempt: any piece, or none, may sit there.
+        let mut renamed_blank = v.clone();
+        renamed_blank[blank] = "<blank>".to_string();
+        assert!(Speller::new(t.clone(), &renamed_blank, blank).is_ok());
+        assert!(Speller::new(fixture::tokenizer(&v, usize::MAX), &v, blank).is_ok());
+        // And the real tokenizer against a tiny vocabulary.
+        if Path::new(REAL_TOKENIZER).exists() {
+            let real = load_tokenizer(Path::new(REAL_TOKENIZER)).unwrap();
+            assert!(Speller::new(real, &v, blank).is_err());
+        }
+    }
+
+    #[test]
+    fn a_missing_tokenizer_file_is_an_error() {
+        assert!(load_tokenizer(Path::new("no/such/tokenizer.json")).is_err());
     }
 
     #[test]
     fn every_spelling_starts_at_a_word_start() {
-        let (v, b) = fixture();
-        let sp = Speller::new(&v, b);
-        for phrase in ["Cairn", "New York", ".env"] {
+        let (v, b) = small();
+        let sp = speller(&v, b);
+        for phrase in ["Cairn", "New York"] {
             for s in sp.spell(phrase).unwrap() {
                 assert!(v[s[0] as usize].starts_with('▁'), "{phrase}: {s:?}");
             }
@@ -182,8 +303,8 @@ mod tests {
 
     #[test]
     fn case_variants_are_spelled_too() {
-        let (v, b) = fixture();
-        let sp = Speller::new(&v, b);
+        let (v, b) = small();
+        let sp = speller(&v, b);
         for p in ["cairn", "CAIRN"] {
             let got = sp.spell(p).unwrap();
             assert!(got.contains(&vec![id(&v, "▁Ca"), id(&v, "irn")]), "{p}");
@@ -193,8 +314,8 @@ mod tests {
 
     #[test]
     fn a_phrase_of_two_letters_or_fewer_is_skipped() {
-        let (v, b) = fixture();
-        let sp = Speller::new(&v, b);
+        let (v, b) = small();
+        let sp = speller(&v, b);
         for p in ["AI", "Q", ".a", "   ", ""] {
             assert_eq!(sp.spell(p), Err(SkipReason::TooShort), "{p:?}");
         }
@@ -202,93 +323,27 @@ mod tests {
 
     #[test]
     fn an_unspellable_phrase_is_skipped_not_fatal() {
-        let (v, b) = fixture();
-        let sp = Speller::new(&v, b);
+        let (v, b) = small();
+        let sp = speller(&v, b);
         assert_eq!(sp.spell("Zürich"), Err(SkipReason::NotSpellable));
         assert_eq!(sp.spell("abc🙂"), Err(SkipReason::NotSpellable));
     }
 
     #[test]
-    fn a_leading_dot_spells_through_a_bare_word_start() {
-        let (v, b) = fixture();
-        let sp = Speller::new(&v, b);
-        assert_eq!(
-            sp.spell(".env").unwrap(),
-            vec![vec![id(&v, "▁"), id(&v, "."), id(&v, "env")]]
-        );
-        assert_eq!(
-            sp.spell(".claude").unwrap(),
-            vec![vec![id(&v, "▁"), id(&v, "."), id(&v, "cl"), id(&v, "aude")]]
-        );
-    }
-
-    #[test]
-    fn special_pieces_are_never_used() {
-        // "<abc>" is special; with blank = "▁abc" (id 2) only the 2-piece route is left.
-        let v = vocab(&["<unk>", "▁ab", "▁abc", "<abc>", "c"]);
-        let got = Speller::new(&v, 2).spell("abc").unwrap();
-        assert_eq!(got, vec![vec![1, 4]]);
-        assert!(got.iter().flatten().all(|&t| t != 2 && t != 3 && t != 0));
-        // And with only specials/blank available the phrase is unspellable.
-        let v = vocab(&["<unk>", "▁abc", "<abc>"]);
-        assert_eq!(Speller::new(&v, 1).spell("abc"), Err(SkipReason::NotSpellable));
-    }
-
-    #[test]
     fn a_literal_special_piece_is_not_matched_by_its_text() {
-        // Without the `<...>` filter this would spell as [▁, <unk>].
+        // An encoding that yields a `<…>` piece is never a spelling.
         let v = vocab(&["▁", "<unk>", "<blk>"]);
-        assert_eq!(Speller::new(&v, 2).spell("<unk>"), Err(SkipReason::NotSpellable));
+        assert_eq!(speller(&v, 2).spell("<unk>"), Err(SkipReason::NotSpellable));
     }
 
     #[test]
     fn a_multi_word_phrase_spans_the_space() {
-        let (v, b) = fixture();
-        let sp = Speller::new(&v, b);
+        let (v, b) = small();
+        let sp = speller(&v, b);
         assert_eq!(
             sp.spell("New York").unwrap(),
             vec![vec![id(&v, "▁New"), id(&v, "▁York")]]
         );
         assert_eq!(sp.spell("  New \t York ").unwrap(), sp.spell("New York").unwrap());
-    }
-
-    #[test]
-    fn spellings_are_capped_and_ordered() {
-        // "▁abcdefgh" splits into two pieces 7 ways (prefix + suffix).
-        let v = vocab(&[
-            "▁a", "▁ab", "▁abc", "▁abcd", "▁abcde", "▁abcdef", "▁abcdefg", "bcdefgh", "cdefgh",
-            "defgh", "efgh", "fgh", "gh", "h",
-        ]);
-        let got = Speller::new(&v, 99).spell("abcdefgh").unwrap();
-        assert_eq!(got.len(), MAX_SPELLINGS_PER_VARIANT);
-        assert!(got.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(got[0], vec![0, 7]);
-        assert_eq!(got[4], vec![4, 11]);
-    }
-
-    /// The five punctuation phrases against the real model vocab, when installed.
-    #[test]
-    fn punctuation_phrases_spell_in_the_real_vocab() {
-        let path =
-            r"C:\Users\geisl\AppData\Roaming\speakey\app\data\models\parakeet-tdt-v3\vocab.txt";
-        let Ok(text) = std::fs::read_to_string(path) else {
-            eprintln!("skipped: vocab not found at {path}");
-            return;
-        };
-        let mut v: Vec<String> = Vec::new();
-        for line in text.lines() {
-            let (tok, idx) = line.rsplit_once(' ').unwrap();
-            let idx: usize = idx.parse().unwrap();
-            if v.len() <= idx {
-                v.resize(idx + 1, String::new());
-            }
-            v[idx] = tok.to_string();
-        }
-        let blank = v.len(); // the blank sits after the listed pieces
-        let sp = Speller::new(&v, blank);
-        for p in [".claude", ".env", "claude.md", "dockbox-prod", "parakeet-rs"] {
-            let got = sp.spell(p).unwrap_or_else(|e| panic!("{p}: {e:?}"));
-            assert!(!got.is_empty(), "{p}");
-        }
     }
 }

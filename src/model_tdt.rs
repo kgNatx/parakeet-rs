@@ -696,7 +696,9 @@ mod boost_decode_tests {
 
     fn booster(phrases: &[&str], strength: f32) -> PhraseBooster {
         let p: Vec<String> = phrases.iter().map(|s| s.to_string()).collect();
-        PhraseBooster::new(&pieces(), BLANK, &p, strength)
+        let v = pieces();
+        let t = crate::phrase_boost::fixture_tokenizer(&v, BLANK);
+        PhraseBooster::new(&v, BLANK, t, &p, strength).unwrap()
     }
 
     /// Replays logits by call index, whatever token is fed back, and records the calls.
