@@ -46,7 +46,6 @@ fn token_score(c0: f32, beta: f32, i: u16) -> f32 {
     }
 }
 
-#[allow(dead_code)] // consumed by A4
 impl Tree {
     /// Empty sequences are ignored. When two sequences are identical, the
     /// first one's phrase index is kept.
@@ -131,7 +130,9 @@ impl Tree {
     /// The absolute score of emitting `tok` from state `s`: the backoffs paid
     /// on the way to the first node with an arc for `tok`, plus that arc's
     /// score. A token with no arc anywhere on the chain pays all backoffs and
-    /// gains 0.
+    /// gains 0. The decoder uses `step_bonus`; this is the definition the tests
+    /// check it against.
+    #[cfg(test)]
     pub(crate) fn score(&self, s: NodeId, tok: u32) -> f32 {
         let mut acc = 0.0;
         let mut cur = s;
@@ -171,16 +172,19 @@ impl Tree {
         self.nodes[ROOT as usize].children.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn node_score(&self, s: NodeId) -> f32 {
         self.nodes[s as usize].score
     }
 
+    #[cfg(test)]
     pub(crate) fn fail(&self, s: NodeId) -> NodeId {
         self.nodes[s as usize].fail
     }
 
     /// The node reached by `path` from the root, with no fail links. Panics if
     /// the path is not in the tree; this is a test accessor.
+    #[cfg(test)]
     pub(crate) fn node_for(&self, path: &[u32]) -> NodeId {
         path.iter().fold(ROOT, |cur, tok| {
             *self.nodes[cur as usize]
@@ -289,6 +293,18 @@ mod tests {
             let n = t.node_for(&[1, 2, 3, 4, 5][..=i]);
             assert!(close(t.node_score(n), *w), "depth {} {}", i + 1, t.node_score(n));
         }
+    }
+
+    #[test]
+    fn depth_scores_scale_with_c0() {
+        // c0 = 2: the first token is worth c0, every later one c0 * beta + ln(i + 1)
+        let t = Tree::build(&[(vec![1, 2, 3], 0)], 2.0, 2.0);
+        let want = [2.0, 2.0 + 4.0 + 2f32.ln(), 2.0 + 8.0 + 2f32.ln() + 3f32.ln()];
+        for (i, w) in want.iter().enumerate() {
+            let n = t.node_for(&[1, 2, 3][..=i]);
+            assert!(close(t.node_score(n), *w), "depth {} {}", i + 1, t.node_score(n));
+        }
+        assert!(close(t.score(ROOT, 1), 2.0));
     }
 
     #[test]

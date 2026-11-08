@@ -72,14 +72,13 @@ pub mod cohere;
 mod timestamps;
 mod transcriber;
 mod vocab;
-// Consumers (PhraseBooster) arrive in later tasks.
-#[allow(dead_code)]
 mod phrase_boost;
 
 pub use error::{Error, Result};
 pub use execution::{ExecutionProvider, ModelConfig as ExecutionConfig};
 pub use parakeet::Parakeet;
 pub use parakeet_tdt::ParakeetTDT;
+pub use phrase_boost::{BoostHit, BoostOutcome, PhraseBooster, SkipReason};
 pub use timestamps::TimestampMode;
 pub use transcriber::*;
 
