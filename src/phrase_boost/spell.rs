@@ -235,6 +235,13 @@ mod tests {
     }
 
     #[test]
+    fn a_literal_special_piece_is_not_matched_by_its_text() {
+        // Without the `<...>` filter this would spell as [▁, <unk>].
+        let v = vocab(&["▁", "<unk>", "<blk>"]);
+        assert_eq!(Speller::new(&v, 2).spell("<unk>"), Err(SkipReason::NotSpellable));
+    }
+
+    #[test]
     fn a_multi_word_phrase_spans_the_space() {
         let (v, b) = fixture();
         let sp = Speller::new(&v, b);
@@ -265,6 +272,7 @@ mod tests {
         let path =
             r"C:\Users\geisl\AppData\Roaming\speakey\app\data\models\parakeet-tdt-v3\vocab.txt";
         let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("skipped: vocab not found at {path}");
             return;
         };
         let mut v: Vec<String> = Vec::new();
