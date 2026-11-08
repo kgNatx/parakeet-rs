@@ -6,7 +6,9 @@
 mod spell;
 mod tree;
 
-use crate::error::Error;
+use crate::error::{Error, Result};
+use crate::vocab::Vocabulary;
+use std::path::Path;
 use crate::model_tdt::argmax_last;
 use spell::Speller;
 use std::collections::hash_map::Entry;
@@ -64,6 +66,8 @@ pub struct PhraseBooster {
     tree: Tree,
     vocab_len: usize,
     vocab_fingerprint: u64,
+    /// The vocabulary's pieces, id -> piece, for reading emitted token ids back.
+    pieces: Vec<String>,
 }
 
 impl PhraseBooster {
@@ -141,7 +145,26 @@ impl PhraseBooster {
             tree: Tree::build(&seqs, C0, BETA),
             vocab_len: id_to_token.len(),
             vocab_fingerprint: fingerprint(id_to_token),
+            pieces: id_to_token.to_vec(),
         }
+    }
+
+    /// Compile `phrases` for `vocab`. The ONE place the blank id is defined: the decode loop's
+    /// blank is `vocab_size - 1`, and the model's `vocab_size` is `vocab.size()`.
+    pub(crate) fn from_vocabulary(vocab: &Vocabulary, phrases: &[String], strength: f32) -> PhraseBooster {
+        let blank_id = vocab.size().saturating_sub(1);
+        PhraseBooster::new(&vocab.id_to_token, blank_id, phrases, strength)
+    }
+
+    /// Compile `phrases` for the vocabulary in a model dir's `vocab.txt`, without loading any
+    /// model. The result equals `ParakeetTDT::phrase_booster` for the same vocabulary.
+    pub fn from_vocab_file(path: &Path, phrases: &[String], strength: f32) -> Result<PhraseBooster> {
+        Ok(Self::from_vocabulary(&Vocabulary::from_file(path)?, phrases, strength))
+    }
+
+    /// The vocabulary this booster was built for, `id -> piece`.
+    pub fn pieces(&self) -> &[String] {
+        &self.pieces
     }
 
     /// The boosted phrases, in first-seen order. `RawHit::phrase` indexes this.
@@ -359,6 +382,36 @@ mod tests {
 
     fn phrases(p: &[&str]) -> Vec<String> {
         p.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_vocab_file_builds_the_same_booster_as_the_model_does() {
+        let dir = std::env::temp_dir().join(format!("pb-vocab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vocab.txt");
+        let (v, _) = vocab();
+        let text: String = v.iter().enumerate().map(|(i, t)| format!("{t} {i}
+")).collect();
+        std::fs::write(&path, text).unwrap();
+        let p = phrases(&["cairn", "Cairn", "ai"]);
+        let from_file = PhraseBooster::from_vocab_file(&path, &p, 2.0).unwrap();
+        let (v, blank) = vocab();
+        let direct = PhraseBooster::new(&v, blank, &p, 2.0);
+        assert_eq!(from_file.vocab_fingerprint, direct.vocab_fingerprint);
+        assert_eq!(from_file.vocab_len, direct.vocab_len);
+        assert_eq!(from_file.blank_id, direct.blank_id, "blank is vocab size - 1 either way");
+        assert_eq!(from_file.phrases(), direct.phrases());
+        assert_eq!(from_file.spellings("cairn"), direct.spellings("cairn"));
+        assert_eq!(from_file.root_fan_out(), direct.root_fan_out());
+        assert!(from_file.check_vocab(&v).is_ok());
+        assert!(PhraseBooster::from_vocab_file(&dir.join("missing.txt"), &p, 2.0).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pieces_are_the_vocabulary_by_id() {
+        let b = booster(&["cairn"], 1.0);
+        assert_eq!(b.pieces(), vocab().0.as_slice());
     }
 
     fn booster(p: &[&str], strength: f32) -> PhraseBooster {

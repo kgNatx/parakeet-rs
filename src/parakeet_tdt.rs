@@ -117,11 +117,7 @@ impl ParakeetTDT {
     /// `[0, PhraseBooster::MAX_STRENGTH]`). About a millisecond; build once, reuse across calls.
     /// Phrases it cannot boost are listed in [`PhraseBooster::skipped`] with their reason.
     pub fn phrase_booster(&self, phrases: &[String], strength: f32) -> PhraseBooster {
-        let vocab = self.decoder.vocab();
-        // The decode loop's blank is `vocab_size - 1`, and the model's `vocab_size` is
-        // `vocab.size()`; pass that same id so the booster and the loop cannot disagree.
-        let blank_id = vocab.size().saturating_sub(1);
-        PhraseBooster::new(&vocab.id_to_token, blank_id, phrases, strength)
+        PhraseBooster::from_vocabulary(self.decoder.vocab(), phrases, strength)
     }
 
     /// [`transcribe_samples_with_encoder`](Self::transcribe_samples_with_encoder), with the greedy
