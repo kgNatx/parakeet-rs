@@ -21,8 +21,12 @@ pub(crate) fn load_tokenizer(path: &Path) -> Result<Tokenizer> {
 /// Letters are alphanumeric characters; `TooShort` when there are ≤ 2 of them
 /// (so a whitespace-only phrase is always `TooShort`). A variant whose encoding
 /// is empty or holds the blank or any `<…>` piece (`<unk>`, byte fallback, a
-/// control token), or whose first piece does not start a word (`▁…`), is no
-/// spelling; `NotSpellable` when no variant spells. A phrase holding any digit
+/// control token), or whose first piece does not start a word WITH a letter or
+/// digit (`▁c…`; a bare `▁` or `▁.` does not), is no spelling; `NotSpellable`
+/// when no variant spells. The first piece earns a bonus at every decode step,
+/// and a bare `▁` is the piece Parakeet starts every number in digits with:
+/// boosting `.claude` (`▁|.|c|la|ude`) turned spelled-out numbers into digits in
+/// 645 Earnings-22 clips, +0.31 WER points (Speakey scoreboard, 2026-11-09). A phrase holding any digit
 /// (`char::is_numeric`) is `NotSpellable` before encoding: the published
 /// tokenizer splits digits out first and loses or misplaces the word boundary
 /// around them (`Windows 11` → `…|s|1|1`, `7zip` → `7|▁z|ip`), which is not how
@@ -32,7 +36,7 @@ pub(crate) struct Speller {
     tokenizer: Tokenizer,
     /// Per token id: may this piece appear in a spelling?
     usable: Vec<bool>,
-    /// Per token id: does this piece start a word (`▁…`)?
+    /// Per token id: does this piece start a word with a letter or digit (`▁c…`)?
     word_start: Vec<bool>,
 }
 
@@ -76,7 +80,10 @@ impl Speller {
                 id != blank_id && !tok.is_empty() && !special
             })
             .collect();
-        let word_start = id_to_token.iter().map(|t| t.starts_with('▁')).collect();
+        let word_start = id_to_token
+            .iter()
+            .map(|t| t.starts_with('▁') && t.chars().any(char::is_alphanumeric))
+            .collect();
         Ok(Speller { tokenizer, usable, word_start })
     }
 
@@ -225,7 +232,6 @@ mod tests {
             ("kneeling", "▁k|ne|el|ing"),
             ("Covalex", "▁C|ov|ale|x"),
             ("dockbox-prod", "▁do|ck|bo|x|-|pro|d"),
-            (".claude", "▁|.|c|la|ude"),
             ("claude.md", "▁c|la|ude|.|m|d"),
             ("parakeet-rs", "▁par|ake|et|-|rs"),
         ] {
@@ -287,9 +293,24 @@ mod tests {
         ] {
             let Ok(got) = sp.spell(p) else { continue };
             for s in &got {
-                assert!(v[s[0] as usize].starts_with('▁'), "{p}: {:?}", as_pieces(&v, &got));
+                let first = &v[s[0] as usize];
+                assert!(
+                    first.starts_with('▁') && first.chars().any(char::is_alphanumeric),
+                    "{p}: {:?}",
+                    as_pieces(&v, &got)
+                );
             }
         }
+    }
+
+    /// `.claude` is spelled `▁|.|c|la|ude` by the real tokenizer: its first piece names no
+    /// letter, so boosting it would bonus a bare `▁` at every step. Not a spelling.
+    #[test]
+    fn a_phrase_whose_first_piece_holds_no_letter_is_not_spellable() {
+        let Some((_, _, sp)) = real() else { return };
+        assert_eq!(sp.spell(".claude"), Err(SkipReason::NotSpellable));
+        assert!(sp.spell("Claude").is_ok());
+        assert!(sp.spell("claude.md").is_ok(), "a dot later in the phrase is fine");
     }
 
     #[test]
