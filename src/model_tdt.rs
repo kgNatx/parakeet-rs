@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
-use crate::phrase_boost::{BoostTrace, PhraseBooster};
+use crate::phrase_boost::{BoostCursor, BoostTrace, PhraseBooster};
 use ndarray::{Array1, Array2, Array3};
 use ort::session::Session;
 use std::path::{Path, PathBuf};
@@ -275,7 +275,7 @@ impl ParakeetTDTModel {
         let time_steps = encoder_out.shape()[2];
         let vocab_size = self.config.vocab_size;
         let mut joint = OnnxJoint::new(&mut self.decoder_joint, encoder_out);
-        decode_steps(&mut joint, time_steps, vocab_size, booster)
+        decode_utterance(&mut joint, time_steps, vocab_size, booster)
     }
 }
 
@@ -291,6 +291,8 @@ pub(crate) trait Joint {
     fn logits(&mut self, t: usize, last_token: i32) -> Result<Vec<f32>>;
     /// Adopt the prediction-network state that the most recent `logits` call produced.
     fn accept(&mut self) -> Result<()>;
+    /// Return to the state before the first `logits` call, so the utterance can be walked again.
+    fn reset(&mut self) -> Result<()>;
 }
 
 /// The result of a greedy TDT walk, one entry per emitted (non-blank) token.
@@ -339,14 +341,15 @@ pub(crate) fn tdt_blank_id(vocab_size: usize) -> usize {
 /// that a blank (or `max_tokens_per_step` symbols on one frame) advances one frame, and that the
 /// prediction network advances only on emission. It knows nothing about ONNX; `joint` does.
 ///
-/// With a `booster`, its cursor picks each token (blank vs non-blank stays the unbiased decision)
-/// and is told every emitted token; nothing else in the walk changes. Confidence is always the
-/// softmax of the chosen token under the UNBIASED logits. `booster = None` is today's decode.
+/// With a booster's `cursor`, the cursor picks each token (blank vs non-blank stays the unbiased
+/// decision) and is told every emitted token; nothing else in the walk changes. Confidence is
+/// always the softmax of the chosen token under the UNBIASED logits. `cursor = None` is today's
+/// decode. One walk only: [`decode_utterance`] owns when to walk again.
 pub(crate) fn decode_steps(
     joint: &mut dyn Joint,
     time_steps: usize,
     vocab_size: usize,
-    booster: Option<&PhraseBooster>,
+    cursor: Option<BoostCursor<'_>>,
 ) -> Result<Decoded> {
     let max_tokens_per_step = 10;
     let blank_id = tdt_blank_id(vocab_size);
@@ -359,7 +362,7 @@ pub(crate) fn decode_steps(
     let mut t = 0;
     let mut emitted_tokens = 0;
     let mut last_emitted_token = blank_id as i32;
-    let mut cursor = booster.map(PhraseBooster::cursor);
+    let mut cursor = cursor;
 
     // Frame-by-frame RNN-T/TDT greedy decoding
     while t < time_steps {
@@ -416,6 +419,39 @@ pub(crate) fn decode_steps(
         confidences,
         trace: cursor.map(|c| c.finish()),
     })
+}
+
+/// Greedy-decode one utterance, boosted toward `booster`'s phrases when given.
+///
+/// **Boosting never decides how an utterance ends.** If boosting changed any token of the
+/// decode's last word ([`PhraseBooster::forced_last_word`]), the utterance is walked again from
+/// the start with boosting stopped at that word's first token: the result is the boosted decode up
+/// to that word and the model's own decode from there. The second walk happens only then, and its
+/// prefix is the first walk's exactly (same logits, same picks).
+///
+/// Why: the end of the audio is where speech is most often cut off, and with nothing after it to
+/// disagree, the booster finishes a fragment as a custom word ("Mary B." -> "Mary Bowerbird").
+/// Measured 2026-11-09 (Speakey `scoreboard hits`): on Earnings-21, 161 of the 249 forced phrases
+/// that the reference did not contain were the decode's last word; of the forced phrases it did
+/// contain, 0 of 45 (Earnings-21) and 1 of 241 (LibriSpeech test-clean) were.
+///
+/// Known limit, accepted: one second walk only. If the model's own tail adds no word, the last
+/// word is an earlier one, which boosting may have changed.
+pub(crate) fn decode_utterance(
+    joint: &mut dyn Joint,
+    time_steps: usize,
+    vocab_size: usize,
+    booster: Option<&PhraseBooster>,
+) -> Result<Decoded> {
+    let first = decode_steps(joint, time_steps, vocab_size, booster.map(PhraseBooster::cursor))?;
+    let (Some(b), Some(trace)) = (booster, first.trace.as_ref()) else {
+        return Ok(first);
+    };
+    let Some(word) = b.forced_last_word(&first.tokens, trace) else {
+        return Ok(first);
+    };
+    joint.reset()?;
+    decode_steps(joint, time_steps, vocab_size, Some(b.cursor_until(word)))
 }
 
 /// Raw `(dims, data)` of one extracted output state, not yet shaped.
@@ -510,6 +546,13 @@ impl Joint for OnnxJoint<'_> {
         }
         Ok(())
     }
+
+    fn reset(&mut self) -> Result<()> {
+        self.state_h.fill(0.0);
+        self.state_c.fill(0.0);
+        self.pending = None;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -580,6 +623,9 @@ mod decode_tests {
                 self.accepted.push(s);
             }
             Ok(())
+        }
+        fn reset(&mut self) -> Result<()> {
+            unreachable!("the walk tests decode one walk")
         }
     }
 
@@ -697,6 +743,7 @@ mod boost_decode_tests {
     const CA: usize = 1;
     const IRN: usize = 2;
     const THE: usize = 3;
+    const DOG: usize = 4;
 
     fn pieces() -> Vec<String> {
         ["<unk>", "▁ca", "irn", "▁the", "▁dog", "s", "▁cat", "▁a", "b", "<blk>"]
@@ -718,23 +765,32 @@ mod boost_decode_tests {
         calls: Vec<(usize, i32)>,
         /// Call indices whose state was accepted, i.e. that emitted a token.
         accepted: Vec<usize>,
+        /// `calls.len()` when the current walk began; `reset` starts a new walk.
+        walk_start: usize,
+        /// How many times `reset` was called.
+        resets: usize,
     }
 
     impl Replay {
         fn new(script: Vec<Vec<f32>>) -> Self {
-            Self { script, calls: Vec::new(), accepted: Vec::new() }
+            Self { script, calls: Vec::new(), accepted: Vec::new(), walk_start: 0, resets: 0 }
         }
     }
 
     impl Joint for Replay {
         fn logits(&mut self, t: usize, last_token: i32) -> Result<Vec<f32>> {
-            let i = self.calls.len();
+            let i = self.calls.len() - self.walk_start;
             assert!(i < self.script.len(), "script exhausted at call {i} (t={t})");
             self.calls.push((t, last_token));
             Ok(self.script[i].clone())
         }
         fn accept(&mut self) -> Result<()> {
             self.accepted.push(self.calls.len() - 1);
+            Ok(())
+        }
+        fn reset(&mut self) -> Result<()> {
+            self.walk_start = self.calls.len();
+            self.resets += 1;
             Ok(())
         }
     }
@@ -768,7 +824,14 @@ mod boost_decode_tests {
 
     fn run(script: &[Vec<f32>], frames: usize, b: Option<&PhraseBooster>) -> (Decoded, Replay) {
         let mut j = Replay::new(script.to_vec());
-        let d = decode_steps(&mut j, frames, V, b).unwrap();
+        let d = decode_steps(&mut j, frames, V, b.map(PhraseBooster::cursor)).unwrap();
+        (d, j)
+    }
+
+    /// Like `run`, through [`decode_utterance`] (the end rule included).
+    fn utterance(script: &[Vec<f32>], frames: usize, b: Option<&PhraseBooster>) -> (Decoded, Replay) {
+        let mut j = Replay::new(script.to_vec());
+        let d = decode_utterance(&mut j, frames, V, b).unwrap();
         (d, j)
     }
 
@@ -893,5 +956,48 @@ mod boost_decode_tests {
         let want = (1.0f32 - 2.0).exp() / sum;
         assert_eq!(boosted.confidences[1].to_bits(), want.to_bits());
         assert!(boosted.confidences[1] < 0.5);
+    }
+
+    #[test]
+    fn boosting_never_decides_the_last_word() {
+        // The walk alone boosts `▁the` into `irn`, so "cairn" ends the utterance ...
+        let script = cairn_script();
+        let b = booster(&["cairn"], 1.0);
+        let (walked, _) = run(&script, 5, Some(&b));
+        assert_eq!(walked.tokens, vec![CA, IRN]);
+        // ... so the utterance is walked again, unboosted from that word's first token on.
+        let (plain, _) = run(&script, 5, None);
+        let (d, j) = utterance(&script, 5, Some(&b));
+        assert_identical(&d, &plain);
+        assert_eq!(j.resets, 1);
+        let trace = d.trace.unwrap();
+        assert!(trace.changed.iter().all(|&c| !c));
+        assert!(trace.hits.is_empty());
+    }
+
+    #[test]
+    fn a_forced_word_followed_by_another_word_stands_in_one_walk() {
+        // As `cairn_script`, then `▁dog` the model chooses on its own.
+        let mut script = cairn_script();
+        script.insert(3, step(&[(DOG, 3.0)], 1));
+        let b = booster(&["cairn"], 1.0);
+        let (d, j) = utterance(&script, 5, Some(&b));
+        assert_eq!(d.tokens, vec![CA, IRN, DOG]);
+        assert_eq!(j.resets, 0, "no second walk");
+        let (walked, _) = run(&script, 5, Some(&b));
+        assert_identical(&d, &walked);
+    }
+
+    #[test]
+    fn without_a_booster_or_with_nothing_forced_there_is_one_walk() {
+        let script = lcg_script();
+        let (plain, _) = run(&script, LCG_FRAMES, None);
+        let (d, j) = utterance(&script, LCG_FRAMES, None);
+        assert_identical(&d, &plain);
+        assert_eq!(j.resets, 0);
+        let empty = booster(&[], 1.0);
+        let (d, j) = utterance(&script, LCG_FRAMES, Some(&empty));
+        assert_identical(&d, &plain);
+        assert_eq!(j.resets, 0);
     }
 }

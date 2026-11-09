@@ -261,7 +261,10 @@ fn boost_outcome(
             phrase: b.phrases()[h.phrase as usize].text.clone(),
             start: at(h.first),
             end: at(h.last) + seconds_per_frame,
-            changed: trace.changed[h.first..=h.last].iter().any(|&c| c),
+            weakest_forced: (h.first..=h.last)
+                .filter(|&i| trace.changed[i])
+                .map(|i| decoded.confidences[i])
+                .reduce(f32::min),
         })
         .collect();
     outcome
@@ -302,7 +305,7 @@ mod tests {
             tokens: vec![5, 1, 2, 3, 4],
             frame_indices: vec![0, 4, 6, 10, 12],
             durations: vec![1, 2, 1, 2, 1],
-            confidences: vec![0.9; 5],
+            confidences: vec![0.9, 0.8, 0.02, 0.7, 0.6],
             trace,
         }
     }
@@ -325,11 +328,14 @@ mod tests {
         assert_eq!(o.hits[0].phrase, "cairn");
         assert_eq!(o.hits[0].start, token_start_seconds(4, 160, 16000));
         assert_eq!(o.hits[0].end, token_start_seconds(6, 160, 16000) + spf);
-        assert!(o.hits[0].changed);
+        // Only token 2 was changed, so only its confidence counts, not its phrase-mate's 0.8.
+        assert_eq!(o.hits[0].weakest_forced, Some(0.02));
+        assert!(o.hits[0].changed());
         assert_eq!(o.hits[1].phrase, "dogs");
         assert_eq!(o.hits[1].start, token_start_seconds(10, 160, 16000));
         assert_eq!(o.hits[1].end, token_start_seconds(12, 160, 16000) + spf);
-        assert!(!o.hits[1].changed);
+        assert_eq!(o.hits[1].weakest_forced, None);
+        assert!(!o.hits[1].changed());
     }
 
     #[test]

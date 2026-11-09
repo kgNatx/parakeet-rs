@@ -52,8 +52,17 @@ pub struct BoostHit {
     /// Seconds.
     pub start: f32,
     pub end: f32,
+    /// The lowest probability the UNBIASED model gave any token that boosting put in this phrase
+    /// in place of the model's own pick: how weakly the audio supported what was forced. `None`
+    /// when boosting changed none of its tokens (the model typed the phrase on its own).
+    pub weakest_forced: Option<f32>,
+}
+
+impl BoostHit {
     /// Whether boosting changed any of its tokens.
-    pub changed: bool,
+    pub fn changed(&self) -> bool {
+        self.weakest_forced.is_some()
+    }
 }
 
 /// What boosting did to one decode.
@@ -280,13 +289,31 @@ impl PhraseBooster {
     /// A fresh per-decode cursor at the tree's root. An empty booster still
     /// gives a real cursor, whose picks are plain argmax.
     pub(crate) fn cursor(&self) -> BoostCursor<'_> {
+        self.cursor_until(usize::MAX)
+    }
+
+    /// A cursor that boosts only the first `boosted_tokens` emitted tokens and picks every later
+    /// one as plain argmax.
+    pub(crate) fn cursor_until(&self, boosted_tokens: usize) -> BoostCursor<'_> {
         BoostCursor {
             booster: self,
             state: ROOT,
+            boost_until: boosted_tokens,
             last_changed: false,
             changed: Vec::new(),
             hits: Vec::new(),
         }
+    }
+
+    /// The emitted-token index where `tokens`' last word begins, when boosting changed any token
+    /// from there on (`trace` is the walk's own); `None` when the last word, and whatever follows
+    /// it, is the model's own choice, or there is no word at all. A word is a run of pieces that
+    /// begins with a `▁` piece; pieces with no letter or digit (punctuation) never make one.
+    pub(crate) fn forced_last_word(&self, tokens: &[usize], trace: &BoostTrace) -> Option<usize> {
+        let piece = |i: usize| self.pieces.get(tokens[i]).map_or("", String::as_str);
+        let last = (0..tokens.len()).rev().find(|&i| piece(i).chars().any(char::is_alphanumeric))?;
+        let start = (0..=last).rev().find(|&i| piece(i).starts_with('▁')).unwrap_or(0);
+        trace.changed[start..].iter().any(|&c| c).then_some(start)
     }
 }
 
@@ -333,6 +360,8 @@ fn fingerprint(id_to_token: &[String]) -> u64 {
 pub(crate) struct BoostCursor<'a> {
     booster: &'a PhraseBooster,
     state: NodeId,
+    /// Emitted tokens from this index on are picked as plain argmax.
+    boost_until: usize,
     /// Whether the latest `pick` differs from the unbiased argmax.
     last_changed: bool,
     changed: Vec<bool>,
@@ -350,7 +379,7 @@ impl BoostCursor<'_> {
         let b = self.booster;
         let unbiased = argmax_last(vocab_logits).unwrap_or(b.blank_id);
         self.last_changed = false;
-        if unbiased == b.blank_id {
+        if unbiased == b.blank_id || self.changed.len() >= self.boost_until {
             return unbiased;
         }
         let bonus = b.tree.step_bonus(self.state);
@@ -801,5 +830,36 @@ mod tests {
         assert_eq!(t.changed.len(), emitted);
         assert!(t.changed.iter().all(|&x| !x));
         assert!(t.hits.is_empty());
+    }
+
+    fn trace(changed: &[bool]) -> BoostTrace {
+        BoostTrace { changed: changed.to_vec(), hits: Vec::new() }
+    }
+
+    #[test]
+    fn the_forced_last_word_is_found_where_it_begins() {
+        let b = booster(&["cairn"], 1.0);
+        // "the cairn", "irn" forced: the last word begins at `▁ca`.
+        assert_eq!(b.forced_last_word(&[OFF, CA, IRN], &trace(&[false, false, true])), Some(1));
+        // Only "the" forced: the last word is the model's own.
+        assert_eq!(b.forced_last_word(&[OFF, CA, IRN], &trace(&[true, false, false])), None);
+        // A word whose pieces do not start with `▁` begins at the first token.
+        assert_eq!(b.forced_last_word(&[IRN, IRN], &trace(&[false, true])), Some(0));
+        assert_eq!(b.forced_last_word(&[], &trace(&[])), None);
+    }
+
+    #[test]
+    fn a_cursor_until_n_boosts_only_the_first_n_tokens() {
+        let b = booster(&["cairn"], PhraseBooster::MAX_STRENGTH);
+        // `▁the` narrowly beats `▁ca`, which boosting would overturn.
+        let close = logits(&[(OFF, 1.0), (CA, 0.9)]);
+        let mut c = b.cursor_until(1);
+        assert_eq!(c.pick(&close), CA, "the first token is boosted");
+        c.emitted(CA);
+        let mut c2 = b.cursor_until(1);
+        c2.emitted(OFF);
+        assert_eq!(c2.pick(&close), OFF, "the second is not");
+        c2.emitted(OFF);
+        assert_eq!(c2.finish().changed, vec![false, false]);
     }
 }
