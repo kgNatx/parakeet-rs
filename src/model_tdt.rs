@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
-use crate::phrase_boost::{BoostCursor, BoostTrace, PhraseBooster};
+use crate::phrase_boost::{BoostCursor, BoostTrace, PhraseBooster, Veto};
 use ndarray::{Array1, Array2, Array3};
 use ort::session::Session;
 use std::path::{Path, PathBuf};
@@ -423,35 +423,88 @@ pub(crate) fn decode_steps(
 
 /// Greedy-decode one utterance, boosted toward `booster`'s phrases when given.
 ///
-/// **Boosting never decides how an utterance ends.** If boosting changed any token of the
-/// decode's last word ([`PhraseBooster::forced_last_word`]), the utterance is walked again from
-/// the start with boosting stopped at that word's first token: the result is the boosted decode up
-/// to that word and the model's own decode from there. The second walk happens only then, and its
-/// prefix is the first walk's exactly (same logits, same picks).
+/// **Boosting may change only the words it completes.** In the decode returned, every token that
+/// differs from that walk's unbiased pick lies inside a completed boosted phrase whose last token
+/// is not in the utterance's final word. A phrase is completed when its last piece is emitted and
+/// the next emitted piece starts a new word (or the decode ends), so `Claude` does not count
+/// inside `Claudette`. A multi-word phrase is final when its last token is in the final word.
+/// ([`PhraseBooster::unkept_changes`] is the one definition.)
 ///
-/// Why: the end of the audio is where speech is most often cut off, and with nothing after it to
-/// disagree, the booster finishes a fragment as a custom word ("Mary B." -> "Mary Bowerbird").
-/// Measured 2026-11-09 (Speakey `scoreboard hits`): on Earnings-21, 161 of the 249 forced phrases
-/// that the reference did not contain were the decode's last word; of the forced phrases it did
-/// contain, 0 of 45 (Earnings-21) and 1 of 241 (LibriSpeech test-clean) were.
+/// Why each part. A stray first piece (`▁ca` boosted over `▁the`, then the phrase abandoned) is a
+/// word the model did not hear and the booster did not finish. A phrase continued by another
+/// piece is a different word. And the end of the audio is where speech is most often cut off:
+/// with nothing after it to disagree, the booster finishes a fragment as a custom word ("Mary B."
+/// -> "Mary Bowerbird"). Measured 2026-11-09 (Speakey `scoreboard hits`): on Earnings-21, 161 of
+/// the 249 forced phrases the reference did not contain were the decode's last word; of the forced
+/// phrases it did contain, 0 of 45 (Earnings-21) and 1 of 241 (LibriSpeech test-clean) were.
 ///
-/// Known limit, accepted: one second walk only. If the model's own tail adds no word, the last
-/// word is an earlier one, which boosting may have changed.
+/// How: walk, and while the walk leaves changes it may not keep, walk again from the start with
+/// the EARLIEST such index vetoed as well (picked unbiased; the tree still follows what was
+/// emitted). Every token before that index is identical to the previous walk's (same logits, same
+/// picks), and a vetoed index records no change, so it can never be unkept again: each walk adds
+/// a new index to the veto set. Usually the new index is later than every earlier veto, but not
+/// always: undoing a change can un-complete an earlier phrase (its next piece is now a
+/// continuation) or move the final word, exposing an earlier change. The set still only grows,
+/// so the loop ends; [`MAX_WALKS`] caps it for latency, not for correctness. Past the cap, one
+/// more walk with every index vetoed returns the model's own decode (`fell_back`). The encoder is
+/// not re-run; only the prediction network and joint are walked again.
+///
+/// This was designed twice before re-walking was chosen. Deferring a phrase's bonus until the
+/// phrase completes is impossible in greedy decoding, because the bonus on the first piece is what
+/// makes it win. Rolling back inside the cursor needs prediction-network snapshots, which the
+/// [`Joint`] seam does not offer (`accept`/`reset` only).
 pub(crate) fn decode_utterance(
     joint: &mut dyn Joint,
     time_steps: usize,
     vocab_size: usize,
     booster: Option<&PhraseBooster>,
 ) -> Result<Decoded> {
-    let first = decode_steps(joint, time_steps, vocab_size, booster.map(PhraseBooster::cursor))?;
-    let (Some(b), Some(trace)) = (booster, first.trace.as_ref()) else {
-        return Ok(first);
+    decode_utterance_bounded(joint, time_steps, vocab_size, booster, MAX_WALKS)
+}
+
+/// Boosted walks before the unboosted fallback. A latency cap: each walk re-runs the joint over the
+/// whole utterance.
+pub(crate) const MAX_WALKS: usize = 4;
+
+/// [`decode_utterance`] with the walk bound as a parameter, so the fallback is testable.
+fn decode_utterance_bounded(
+    joint: &mut dyn Joint,
+    time_steps: usize,
+    vocab_size: usize,
+    booster: Option<&PhraseBooster>,
+    max_walks: usize,
+) -> Result<Decoded> {
+    let Some(b) = booster else {
+        return decode_steps(joint, time_steps, vocab_size, None);
     };
-    let Some(word) = b.forced_last_word(&first.tokens, trace) else {
-        return Ok(first);
-    };
-    joint.reset()?;
-    decode_steps(joint, time_steps, vocab_size, Some(b.cursor_until(word)))
+    let mut vetoes: Vec<usize> = Vec::new();
+    for walk in 1..=max_walks {
+        if walk > 1 {
+            joint.reset()?;
+        }
+        // The first walk vetoes nothing: it is the plain boosted decode.
+        let cursor =
+            if vetoes.is_empty() { b.cursor() } else { b.cursor_with(Veto::At(vetoes.clone())) };
+        let mut d = decode_steps(joint, time_steps, vocab_size, Some(cursor))?;
+        let trace = d.trace.as_mut().expect("a booster always leaves a trace");
+        let Some(&first) = b.unkept_changes(&d.tokens, trace).first() else {
+            trace.walks = walk;
+            return Ok(d);
+        };
+        // Never already vetoed (a vetoed index records no change), so the set grows each walk.
+        match vetoes.binary_search(&first) {
+            Err(at) => vetoes.insert(at, first),
+            Ok(_) => debug_assert!(false, "vetoed index {first} reported unkept"),
+        }
+    }
+    if max_walks > 0 {
+        joint.reset()?;
+    }
+    let mut d = decode_steps(joint, time_steps, vocab_size, Some(b.cursor_with(Veto::All)))?;
+    let trace = d.trace.as_mut().expect("a booster always leaves a trace");
+    trace.walks = max_walks + 1;
+    trace.fell_back = true;
+    Ok(d)
 }
 
 /// Raw `(dims, data)` of one extracted output state, not yet shaped.
@@ -828,7 +881,7 @@ mod boost_decode_tests {
         (d, j)
     }
 
-    /// Like `run`, through [`decode_utterance`] (the end rule included).
+    /// Like `run`, through [`decode_utterance`] (re-walks included).
     fn utterance(script: &[Vec<f32>], frames: usize, b: Option<&PhraseBooster>) -> (Decoded, Replay) {
         let mut j = Replay::new(script.to_vec());
         let d = decode_utterance(&mut j, frames, V, b).unwrap();
@@ -973,6 +1026,8 @@ mod boost_decode_tests {
         let trace = d.trace.unwrap();
         assert!(trace.changed.iter().all(|&c| !c));
         assert!(trace.hits.is_empty());
+        assert_eq!(trace.walks, 2);
+        assert!(!trace.fell_back);
     }
 
     #[test]
@@ -984,8 +1039,127 @@ mod boost_decode_tests {
         let (d, j) = utterance(&script, 5, Some(&b));
         assert_eq!(d.tokens, vec![CA, IRN, DOG]);
         assert_eq!(j.resets, 0, "no second walk");
+        assert_eq!(d.trace.as_ref().unwrap().walks, 1);
         let (walked, _) = run(&script, 5, Some(&b));
         assert_identical(&d, &walked);
+    }
+
+    /// Call 0: `▁the` narrowly ahead of `▁ca` (boosting flips it); call 1: `▁dog` clearly, so that
+    /// `cairn` is abandoned; then `cairn_script`'s `▁ca` and its `▁the`-vs-`irn` pair, then `▁dog`.
+    fn stray_script() -> Vec<Vec<f32>> {
+        vec![
+            step(&[(THE, 2.0), (CA, 1.5)], 1),
+            step(&[(DOG, 10.0)], 1),
+            step(&[(CA, 3.0)], 2),
+            step(&[(BLANK, 3.0)], 0),
+            step(&[(THE, 2.0), (IRN, 1.0)], 1),
+            step(&[(DOG, 3.0)], 1),
+        ]
+    }
+    const STRAY_FRAMES: usize = 7;
+
+    #[test]
+    fn a_stray_first_piece_is_undone_and_boosting_resumes_after_it() {
+        let script = stray_script();
+        let b = booster(&["cairn"], 1.0);
+        // The single walk really does flip `▁the` to `▁ca` (a stray, never completed).
+        let (walked, _) = run(&script, STRAY_FRAMES, Some(&b));
+        assert_eq!(walked.tokens, vec![CA, DOG, CA, IRN, DOG]);
+        assert_eq!(walked.trace.as_ref().unwrap().changed[0], true);
+
+        let (d, j) = utterance(&script, STRAY_FRAMES, Some(&b));
+        assert_eq!(d.tokens[0], THE, "the stray is undone");
+        assert_eq!(d.tokens, vec![THE, DOG, CA, IRN, DOG]);
+        let trace = d.trace.as_ref().unwrap();
+        assert!(trace.changed[3], "the completion after the veto is kept");
+        assert_eq!(*d.tokens.last().unwrap(), DOG);
+        assert_eq!(j.resets, 1);
+        assert_eq!(trace.walks, 2);
+        assert!(!trace.fell_back);
+        assert!(b.unkept_changes(&d.tokens, trace).is_empty());
+    }
+
+    #[test]
+    fn a_completed_word_that_continues_is_undone() {
+        // `▁ca`, `irn` forced over `▁the`, then `s`: "cairns" is not "cairn", so nothing is kept.
+        let script = vec![
+            step(&[(CA, 3.0)], 1),
+            step(&[(THE, 2.0), (IRN, 1.0)], 1),
+            step(&[(5, 3.0)], 1),
+            step(&[(DOG, 3.0)], 1),
+        ];
+        let b = booster(&["cairn"], 1.0);
+        let (walked, _) = run(&script, 4, Some(&b));
+        assert_eq!(walked.tokens, vec![CA, IRN, 5, DOG]);
+        let (plain, _) = run(&script, 4, None);
+        let (d, j) = utterance(&script, 4, Some(&b));
+        assert_identical(&d, &plain);
+        assert_eq!(j.resets, 1);
+        let trace = d.trace.unwrap();
+        assert!(trace.changed.iter().all(|&c| !c));
+        assert!(!trace.fell_back);
+    }
+
+    #[test]
+    fn undoing_a_change_can_expose_an_earlier_one() {
+        // Walk 1: "cairn" (irn forced) completed only because a stray `▁ca` follows it. Undoing
+        // the stray (index 2) gives `s`, so "cairn" now continues and its change (index 1, EARLIER)
+        // is unkept too. The veto set still grows every walk.
+        let script = vec![
+            step(&[(CA, 3.0)], 1),
+            step(&[(THE, 2.0), (IRN, 1.0)], 1),
+            step(&[(5, 2.0), (CA, 1.5)], 1),
+            step(&[(DOG, 10.0)], 1),
+            step(&[(DOG, 3.0)], 1),
+        ];
+        let b = booster(&["cairn"], 1.0);
+        let (walked, _) = run(&script, 5, Some(&b));
+        assert_eq!(walked.tokens, vec![CA, IRN, CA, DOG, DOG]);
+        let (plain, _) = run(&script, 5, None);
+        assert_eq!(plain.tokens, vec![CA, THE, 5, DOG, DOG]);
+        let (d, j) = utterance(&script, 5, Some(&b));
+        assert_identical(&d, &plain);
+        let trace = d.trace.unwrap();
+        assert_eq!(trace.walks, 3);
+        assert_eq!(j.resets, 2);
+        assert!(!trace.fell_back);
+        assert!(trace.changed.iter().all(|&c| !c));
+    }
+
+    #[test]
+    fn at_high_strength_the_invariant_holds_on_the_lcg_script() {
+        let script = lcg_script();
+        let b = booster(&["cairn", "dogs"], PhraseBooster::MAX_STRENGTH);
+        let (plain, _) = run(&script, LCG_FRAMES, None);
+        let (d, j) = utterance(&script, LCG_FRAMES, Some(&b));
+        let trace = d.trace.as_ref().unwrap();
+        assert!(trace.walks >= 1 && trace.walks <= MAX_WALKS + 1, "{} walks", trace.walks);
+        assert_eq!(j.resets, trace.walks - 1);
+        assert!(b.unkept_changes(&d.tokens, trace).is_empty());
+        if trace.fell_back {
+            assert_identical(&d, &plain);
+            assert_eq!(trace.walks, MAX_WALKS + 1);
+        }
+    }
+
+    #[test]
+    fn past_the_bound_the_decode_is_plain() {
+        let script = stray_script();
+        let b = booster(&["cairn"], 1.0);
+        let (plain, _) = run(&script, STRAY_FRAMES, None);
+        let mut j = Replay::new(script.clone());
+        let d = decode_utterance_bounded(&mut j, STRAY_FRAMES, V, Some(&b), 1).unwrap();
+        assert_identical(&d, &plain);
+        let trace = d.trace.unwrap();
+        assert!(trace.fell_back);
+        assert_eq!(trace.walks, 2);
+        assert_eq!(j.resets, 1);
+        assert!(trace.changed.iter().all(|&c| !c));
+    }
+
+    #[test]
+    fn the_walk_bound_is_four() {
+        assert_eq!(MAX_WALKS, 4);
     }
 
     #[test]

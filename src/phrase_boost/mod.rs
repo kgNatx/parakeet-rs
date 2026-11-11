@@ -68,11 +68,20 @@ impl BoostHit {
 /// What boosting did to one decode.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BoostOutcome {
+    /// The boosted phrases the decode completed as words (`Claude` inside `Claudette` is not one).
     pub hits: Vec<BoostHit>,
     /// Emitted tokens that differ from the unbiased argmax.
     pub changed_tokens: usize,
     /// Every emitted token id, for the bench probe.
     pub token_ids: Vec<usize>,
+    /// How many times the utterance was walked; 1 when nothing boosting did had to be undone,
+    /// 0 when no booster ran.
+    pub walks: usize,
+    /// True when the walk bound was reached, so the decode returned is the model's own, unboosted.
+    pub fell_back: bool,
+    /// Changes the returned decode kept that break "boosting may change only the words it
+    /// completes". 0 by construction; counted so a caller can check the contract, not trust it.
+    pub unkept_changes: usize,
 }
 
 /// NeMo's boosting-tree defaults (research notes 3.1); not swept.
@@ -295,30 +304,14 @@ impl PhraseBooster {
     /// A cursor that picks the emitted tokens `veto` names as plain argmax, recording no change
     /// there; the tree still advances on whatever was emitted.
     pub(crate) fn cursor_with(&self, veto: Veto) -> BoostCursor<'_> {
-        BoostCursor { veto, ..self.cursor_until(usize::MAX) }
-    }
-
-    /// A cursor that boosts only the first `boosted_tokens` emitted tokens and picks every later
-    /// one as plain argmax.
-    pub(crate) fn cursor_until(&self, boosted_tokens: usize) -> BoostCursor<'_> {
         BoostCursor {
             booster: self,
             state: ROOT,
-            boost_until: boosted_tokens,
-            veto: Veto::None,
+            veto,
             last_changed: false,
             changed: Vec::new(),
             hits: Vec::new(),
         }
-    }
-
-    /// The emitted-token index where `tokens`' last word begins, when boosting changed any token
-    /// from there on (`trace` is the walk's own); `None` when the last word, and whatever follows
-    /// it, is the model's own choice, or there is no word at all. A word is a run of pieces that
-    /// begins with a `▁` piece; pieces with no letter or digit (punctuation) never make one.
-    pub(crate) fn forced_last_word(&self, tokens: &[usize], trace: &BoostTrace) -> Option<usize> {
-        let start = self.final_word_start(tokens)?;
-        trace.changed[start..].iter().any(|&c| c).then_some(start)
     }
 
     /// The emitted-token index where `tokens`' last word begins; `None` when there is no word.
@@ -332,7 +325,8 @@ impl PhraseBooster {
 
     /// The trace's hits that are completed words: the next emitted token is absent or begins a
     /// new word (a `▁` piece, or one with no letter or digit), so `Claude` is not a hit inside
-    /// `Claudette`.
+    /// `Claudette`. A continuation piece with no letter or digit (the `'` of `Claude's`) ends the
+    /// word, so a possessive still counts as the phrase completed.
     pub(crate) fn word_hits(&self, tokens: &[usize], trace: &BoostTrace) -> Vec<RawHit> {
         trace
             .hits
@@ -427,8 +421,6 @@ impl Veto {
 pub(crate) struct BoostCursor<'a> {
     booster: &'a PhraseBooster,
     state: NodeId,
-    /// Emitted tokens from this index on are picked as plain argmax.
-    boost_until: usize,
     /// Emitted-token indices picked as plain argmax.
     veto: Veto,
     /// Whether the latest `pick` differs from the unbiased argmax.
@@ -448,10 +440,7 @@ impl BoostCursor<'_> {
         let b = self.booster;
         let unbiased = argmax_last(vocab_logits).unwrap_or(b.blank_id);
         self.last_changed = false;
-        if unbiased == b.blank_id
-            || self.changed.len() >= self.boost_until
-            || self.veto.covers(self.changed.len())
-        {
+        if unbiased == b.blank_id || self.veto.covers(self.changed.len()) {
             return unbiased;
         }
         let bonus = b.tree.step_bonus(self.state);
@@ -500,10 +489,14 @@ impl BoostCursor<'_> {
         }
     }
 
+    /// This walk's trace, as one walk that did not fall back: the decode loop, which owns the
+    /// re-walks, overwrites `walks` and `fell_back`.
     pub(crate) fn finish(self) -> BoostTrace {
         BoostTrace {
             changed: self.changed,
             hits: self.hits,
+            walks: 1,
+            fell_back: false,
         }
     }
 }
@@ -514,6 +507,10 @@ pub(crate) struct BoostTrace {
     /// Per emitted token: did boosting change it?
     pub changed: Vec<bool>,
     pub hits: Vec<RawHit>,
+    /// Walks the decode took, this one included; set by `decode_utterance`.
+    pub walks: usize,
+    /// True when this is the walk bound's unboosted fallback (`Veto::All`).
+    pub fell_back: bool,
 }
 
 /// A completed phrase: `phrase` indexes `PhraseBooster::phrases()`, and
@@ -907,41 +904,58 @@ mod tests {
     }
 
     fn trace(changed: &[bool]) -> BoostTrace {
-        BoostTrace { changed: changed.to_vec(), hits: Vec::new() }
+        BoostTrace { changed: changed.to_vec(), ..BoostTrace::default() }
     }
 
     #[test]
-    fn the_forced_last_word_is_found_where_it_begins() {
+    fn the_final_word_is_found_where_it_begins() {
         let b = booster(&["cairn"], 1.0);
-        // "the cairn", "irn" forced: the last word begins at `▁ca`.
-        assert_eq!(b.forced_last_word(&[OFF, CA, IRN], &trace(&[false, false, true])), Some(1));
-        // Only "the" forced: the last word is the model's own.
-        assert_eq!(b.forced_last_word(&[OFF, CA, IRN], &trace(&[true, false, false])), None);
+        // "the cairn": the last word begins at `▁ca`.
+        assert_eq!(b.final_word_start(&[OFF, CA, IRN]), Some(1));
+        // A word continued by `s` is still one word.
+        assert_eq!(b.final_word_start(&[OFF, CA, IRN, S]), Some(1));
+        // Trailing punctuation is not a word: the last word is still "cairn".
+        assert_eq!(b.final_word_start(&[OFF, CA, IRN, DOT]), Some(1));
         // A word whose pieces do not start with `▁` begins at the first token.
-        assert_eq!(b.forced_last_word(&[IRN, IRN], &trace(&[false, true])), Some(0));
-        assert_eq!(b.forced_last_word(&[], &trace(&[])), None);
+        assert_eq!(b.final_word_start(&[IRN, IRN]), Some(0));
+        assert_eq!(b.final_word_start(&[DOT]), None);
+        assert_eq!(b.final_word_start(&[]), None);
     }
 
     #[test]
-    fn a_cursor_until_n_boosts_only_the_first_n_tokens() {
+    fn a_veto_at_a_later_index_leaves_the_earlier_ones_boosted() {
         let b = booster(&["cairn"], PhraseBooster::MAX_STRENGTH);
         // `▁the` narrowly beats `▁ca`, which boosting would overturn.
         let close = logits(&[(OFF, 1.0), (CA, 0.9)]);
-        let mut c = b.cursor_until(1);
-        assert_eq!(c.pick(&close), CA, "the first token is boosted");
+        let mut c = b.cursor_with(Veto::At(vec![1]));
+        assert_eq!(c.pick(&close), CA, "index 0 is boosted");
         c.emitted(CA);
-        let mut c2 = b.cursor_until(1);
-        c2.emitted(OFF);
-        assert_eq!(c2.pick(&close), OFF, "the second is not");
-        c2.emitted(OFF);
-        assert_eq!(c2.finish().changed, vec![false, false]);
+        // Index 1 is vetoed, so the large `irn` bonus of the `▁ca` state does not count.
+        assert_eq!(c.pick(&logits(&[(OFF, 2.0), (IRN, 1.0)])), OFF, "index 1 is not");
+        c.emitted(OFF);
+        assert_eq!(c.finish().changed, vec![true, false]);
+    }
+
+    #[test]
+    fn overlapping_hits_count_only_the_completed_word() {
+        // "cairn" ends inside "cairns": both complete in the tree, only "cairns" is a word.
+        let b = booster(&["cairn", "cairns"], 1.0);
+        let mut c = b.cursor();
+        for t in [CA, IRN, S, OFF] {
+            c.emitted(t);
+        }
+        let t = c.finish();
+        let cairn = RawHit { phrase: 0, first: 0, last: 1 };
+        let cairns = RawHit { phrase: 1, first: 0, last: 2 };
+        assert_eq!(t.hits, vec![cairn, cairns]);
+        assert_eq!(b.word_hits(&[CA, IRN, S, OFF], &t), vec![cairns]);
     }
 
     #[test]
     fn a_hit_followed_by_a_new_word_is_a_word_hit() {
         let b = booster(&["cairn"], 1.0);
         let hit = RawHit { phrase: 0, first: 0, last: 1 };
-        let t = BoostTrace { changed: vec![false; 3], hits: vec![hit] };
+        let t = BoostTrace { changed: vec![false; 3], hits: vec![hit], ..BoostTrace::default() };
         assert_eq!(b.word_hits(&[CA, IRN, OFF], &t), vec![hit]);
         // the decode ending also completes the word
         assert_eq!(b.word_hits(&[CA, IRN], &t), vec![hit]);
@@ -953,6 +967,7 @@ mod tests {
         let t = BoostTrace {
             changed: vec![false; 3],
             hits: vec![RawHit { phrase: 0, first: 0, last: 1 }],
+            ..BoostTrace::default()
         };
         assert!(b.word_hits(&[CA, IRN, S], &t).is_empty());
     }
@@ -963,6 +978,7 @@ mod tests {
         let t = BoostTrace {
             changed: vec![false, true, false],
             hits: vec![RawHit { phrase: 0, first: 0, last: 1 }],
+            ..BoostTrace::default()
         };
         assert!(b.unkept_changes(&[CA, IRN, OFF], &t).is_empty());
     }
@@ -973,6 +989,7 @@ mod tests {
         let t = BoostTrace {
             changed: vec![false, false, true],
             hits: vec![RawHit { phrase: 0, first: 1, last: 2 }],
+            ..BoostTrace::default()
         };
         assert_eq!(b.unkept_changes(&[OFF, CA, IRN], &t), vec![2]);
     }
@@ -990,6 +1007,7 @@ mod tests {
         let t = BoostTrace {
             changed: vec![true, true, false, false],
             hits: vec![RawHit { phrase: 0, first: 0, last: 1 }],
+            ..BoostTrace::default()
         };
         assert_eq!(b.unkept_changes(&[CA, IRN, S, OFF], &t), vec![0, 1]);
     }
@@ -1001,12 +1019,14 @@ mod tests {
         let t = BoostTrace {
             changed: vec![false, false, true, false],
             hits: vec![RawHit { phrase: 0, first: 1, last: 2 }],
+            ..BoostTrace::default()
         };
         assert_eq!(b.unkept_changes(&[OFF, CA, IRN, DOT], &t), vec![2]);
         // a completed hit before the final word, then punctuation: kept
         let t = BoostTrace {
             changed: vec![true, true, false, false],
             hits: vec![RawHit { phrase: 0, first: 0, last: 1 }],
+            ..BoostTrace::default()
         };
         assert!(b.unkept_changes(&[CA, IRN, DOT, OFF], &t).is_empty());
         assert_eq!(b.word_hits(&[CA, IRN, DOT, OFF], &t).len(), 1);
@@ -1027,11 +1047,16 @@ mod tests {
     #[test]
     fn a_veto_still_advances_the_tree_on_what_was_emitted() {
         let b = booster(&["cairn"], 1.0);
-        let mut c = b.cursor_with(Veto::At(vec![1]));
-        c.emitted(CA); // emitted, not picked: the walk is at `▁ca`
+        let close = logits(&[(OFF, 1.0), (CA, 0.9)]);
+        let mut c = b.cursor_with(Veto::At(vec![0]));
+        assert_eq!(c.pick(&close), OFF, "vetoed: unbiased");
+        c.emitted(CA); // emitted, not picked: the walk is at `▁ca` all the same
         let mid = logits(&[(OFF, 3.0), (IRN, 1.0)]);
-        assert_eq!(c.pick(&mid), OFF, "vetoed: unbiased");
-        c.emitted(OFF);
+        assert_eq!(c.pick(&mid), IRN, "index 1 is boosted from the `▁ca` state");
+        c.emitted(IRN);
+        let t = c.finish();
+        assert_eq!(t.changed, vec![false, true]);
+        assert_eq!(t.hits, vec![RawHit { phrase: 0, first: 0, last: 1 }]);
     }
 
     #[test]

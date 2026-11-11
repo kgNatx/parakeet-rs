@@ -236,8 +236,10 @@ impl ParakeetTDT {
 }
 
 /// What boosting did to `decoded`, in seconds on the word timestamps' clock. A hit spans from
-/// the start of its first token to the end of the frame its last token sits on. `token_ids` is
-/// filled whether or not a booster ran.
+/// the start of its first token to the end of the frame its last token sits on; only phrases
+/// completed as words are hits (`PhraseBooster::word_hits`). `token_ids` is filled whether or not
+/// a booster ran. `unkept_changes` recounts the decode's contract on what it returned, so a
+/// caller can see it held rather than assume it.
 fn boost_outcome(
     decoded: &Decoded,
     booster: Option<&PhraseBooster>,
@@ -254,8 +256,11 @@ fn boost_outcome(
     };
     let at = |i: usize| token_start_seconds(decoded.frame_indices[i], hop_length, sample_rate);
     outcome.changed_tokens = trace.changed.iter().filter(|&&c| c).count();
-    outcome.hits = trace
-        .hits
+    outcome.walks = trace.walks;
+    outcome.fell_back = trace.fell_back;
+    outcome.unkept_changes = b.unkept_changes(&decoded.tokens, trace).len();
+    outcome.hits = b
+        .word_hits(&decoded.tokens, trace)
         .iter()
         .map(|h| BoostHit {
             phrase: b.phrases()[h.phrase as usize].text.clone(),
@@ -319,6 +324,7 @@ mod tests {
                 RawHit { phrase: 1, first: 1, last: 2 },
                 RawHit { phrase: 0, first: 3, last: 4 },
             ],
+            ..BoostTrace::default()
         };
         let spf = 0.08f32;
         let o = boost_outcome(&decoded(Some(trace)), Some(&b), 160, 16000, spf);
@@ -336,6 +342,41 @@ mod tests {
         assert_eq!(o.hits[1].end, token_start_seconds(12, 160, 16000) + spf);
         assert_eq!(o.hits[1].weakest_forced, None);
         assert!(!o.hits[1].changed());
+    }
+
+    #[test]
+    fn only_completed_words_are_hits_and_the_walks_are_reported() {
+        let b = booster();
+        // Tokens `▁the ▁ca irn ▁dog s`: "cairn" ends before `▁dog`, so it is a word. The second
+        // raw hit ends on `▁ca`, which `irn` continues, so it is not one and is not reported.
+        let trace = BoostTrace {
+            changed: vec![false, false, true, false, false],
+            hits: vec![
+                RawHit { phrase: 1, first: 1, last: 2 },
+                RawHit { phrase: 1, first: 1, last: 1 },
+            ],
+            walks: 3,
+            fell_back: false,
+        };
+        let o = boost_outcome(&decoded(Some(trace)), Some(&b), 160, 16000, 0.08);
+        assert_eq!(o.hits.len(), 1);
+        assert_eq!(o.hits[0].phrase, "cairn");
+        assert_eq!(o.hits[0].start, token_start_seconds(4, 160, 16000));
+        assert_eq!(o.walks, 3);
+        assert!(!o.fell_back);
+        assert_eq!(o.unkept_changes, 0, "the change sits inside a completed, non-final word");
+
+        // A change the contract forbids (a stray in the final word) is counted, not hidden.
+        let stray = BoostTrace {
+            changed: vec![false, false, false, true, false],
+            walks: 5,
+            fell_back: true,
+            ..BoostTrace::default()
+        };
+        let o = boost_outcome(&decoded(Some(stray)), Some(&b), 160, 16000, 0.08);
+        assert_eq!(o.unkept_changes, 1);
+        assert_eq!(o.walks, 5);
+        assert!(o.fell_back);
     }
 
     #[test]
