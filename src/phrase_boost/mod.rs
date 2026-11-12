@@ -74,14 +74,25 @@ pub struct BoostOutcome {
     pub changed_tokens: usize,
     /// Every emitted token id, for the bench probe.
     pub token_ids: Vec<usize>,
-    /// How many times the utterance was walked; 1 when nothing boosting did had to be undone,
-    /// 0 when no booster ran.
+    /// How many walks the utterance took, the fallback's unboosted walk included (so a fallback
+    /// after `n` boosted walks reports `n + 1`); 1 when nothing boosting did had to be undone,
+    /// 0 when no booster ran. For the number that ran with boosting, use [`Self::boosted_walks`].
     pub walks: usize,
     /// True when the walk bound was reached, so the decode returned is the model's own, unboosted.
     pub fell_back: bool,
-    /// Changes the returned decode kept that break "boosting may change only the words it
-    /// completes". 0 by construction; counted so a caller can check the contract, not trust it.
+    /// The decode loop's own recount of changes the returned decode kept that break "boosting may
+    /// change only the words it completes". 0 by construction, because the loop returns only when
+    /// there are none; it is NOT independent evidence. The independent check is a text diff
+    /// against the unboosted decode (Speakey's `scoreboard stray`).
     pub unkept_changes: usize,
+}
+
+impl BoostOutcome {
+    /// Walks that ran with boosting: `walks` minus the fallback's unboosted walk when `fell_back`
+    /// (saturating, so 0 when no booster ran).
+    pub fn boosted_walks(&self) -> usize {
+        self.walks.saturating_sub(usize::from(self.fell_back))
+    }
 }
 
 /// NeMo's boosting-tree defaults (research notes 3.1); not swept.
@@ -1071,5 +1082,15 @@ mod tests {
         let t = c.finish();
         assert_eq!(t.changed, vec![false, false]);
         assert_eq!(t.hits, vec![RawHit { phrase: 0, first: 0, last: 1 }]);
+    }
+
+    #[test]
+    fn boosted_walks_excludes_the_fallbacks_unboosted_walk() {
+        let o = |walks, fell_back| BoostOutcome { walks, fell_back, ..BoostOutcome::default() };
+        assert_eq!(o(0, false).boosted_walks(), 0, "no booster ran");
+        assert_eq!(o(1, false).boosted_walks(), 1);
+        assert_eq!(o(3, false).boosted_walks(), 3);
+        assert_eq!(o(5, true).boosted_walks(), 4);
+        assert_eq!(o(0, true).boosted_walks(), 0, "saturates");
     }
 }

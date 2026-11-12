@@ -851,7 +851,11 @@ mod boost_decode_tests {
     /// 300 steps from a fixed-seed LCG. Token logits are small integers, so exact ties are
     /// common (blank included); the duration head picks 0..4, so frames are skipped.
     fn lcg_script() -> Vec<Vec<f32>> {
-        let mut s: u64 = 0x5eed;
+        lcg_script_seeded(0x5eed)
+    }
+
+    fn lcg_script_seeded(seed: u64) -> Vec<Vec<f32>> {
+        let mut s: u64 = seed;
         let mut next = move || {
             s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (s >> 33) as u32
@@ -1018,7 +1022,7 @@ mod boost_decode_tests {
         let b = booster(&["cairn"], 1.0);
         let (walked, _) = run(&script, 5, Some(&b));
         assert_eq!(walked.tokens, vec![CA, IRN]);
-        // ... so the utterance is walked again, unboosted from that word's first token on.
+        // ... so the forced `irn` is vetoed and the utterance walked again, boosting resuming after it.
         let (plain, _) = run(&script, 5, None);
         let (d, j) = utterance(&script, 5, Some(&b));
         assert_identical(&d, &plain);
@@ -1126,20 +1130,44 @@ mod boost_decode_tests {
         assert!(trace.changed.iter().all(|&c| !c));
     }
 
+    /// Sweeps seeded random scripts at the strongest boost. The sweep must reach each path (a
+    /// re-walk that stands, a fallback at the default bound, a fallback at a bound of 1), or it
+    /// asserts nothing; on every seed the decode must match the unboosted one wherever it fell
+    /// back, and `boosted_walks` must exclude the fallback's walk.
     #[test]
-    fn at_high_strength_the_invariant_holds_on_the_lcg_script() {
-        let script = lcg_script();
+    fn at_high_strength_the_invariant_holds_across_seeded_scripts() {
         let b = booster(&["cairn", "dogs"], PhraseBooster::MAX_STRENGTH);
-        let (plain, _) = run(&script, LCG_FRAMES, None);
-        let (d, j) = utterance(&script, LCG_FRAMES, Some(&b));
-        let trace = d.trace.as_ref().unwrap();
-        assert!(trace.walks >= 1 && trace.walks <= MAX_WALKS + 1, "{} walks", trace.walks);
-        assert_eq!(j.resets, trace.walks - 1);
-        assert!(b.unkept_changes(&d.tokens, trace).is_empty());
-        if trace.fell_back {
-            assert_identical(&d, &plain);
-            assert_eq!(trace.walks, MAX_WALKS + 1);
+        let (mut rewalked, mut fell_back, mut fell_back_at_1) = (0, 0, 0);
+        for seed in 0..64u64 {
+            let script = lcg_script_seeded(seed);
+            let (plain, _) = run(&script, LCG_FRAMES, None);
+            let (d, j) = utterance(&script, LCG_FRAMES, Some(&b));
+            let trace = d.trace.as_ref().unwrap();
+            assert!(trace.walks >= 1 && trace.walks <= MAX_WALKS + 1, "seed {seed}: {} walks", trace.walks);
+            assert_eq!(j.resets, trace.walks - 1);
+            if trace.fell_back {
+                fell_back += 1;
+                assert_identical(&d, &plain);
+                assert_eq!(trace.walks, MAX_WALKS + 1);
+            } else if trace.walks > 1 {
+                rewalked += 1;
+                assert!(b.unkept_changes(&d.tokens, trace).is_empty(), "seed {seed}");
+            }
+            let mut j1 = Replay::new(script);
+            let d1 = decode_utterance_bounded(&mut j1, LCG_FRAMES, V, Some(&b), 1).unwrap();
+            let t1 = d1.trace.as_ref().unwrap();
+            if t1.fell_back {
+                fell_back_at_1 += 1;
+                assert_identical(&d1, &plain);
+                assert_eq!(t1.walks, 2);
+                assert_eq!(j1.resets, 1);
+            } else {
+                assert!(b.unkept_changes(&d1.tokens, t1).is_empty(), "seed {seed}");
+            }
         }
+        assert!(rewalked > 0, "no seed re-walked and stood");
+        assert!(fell_back > 0, "no seed fell back at the default bound");
+        assert!(fell_back_at_1 > 0, "no seed fell back at a bound of 1");
     }
 
     #[test]
