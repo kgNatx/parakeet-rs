@@ -72,11 +72,9 @@ impl ParakeetTDTDecoder {
                     }
                 }
 
-                // Skip special tokens
-                if !(token_text.starts_with('<')
-                    && token_text.ends_with('>')
-                    && token_text != "<unk>")
-                {
+                // Skip special tokens, `<unk>` included: it is the model having no spelling for a
+                // sound, never text (see `unk_is_never_text_or_a_word`).
+                if !(token_text.starts_with('<') && token_text.ends_with('>')) {
                     full_text.push_str(&display_text);
 
                     let conf = if i < confidences.len() {
@@ -121,6 +119,21 @@ mod tests {
             .decode_with_timestamps(&[0, 1, 2, 3], &[0, 1, 2, 3], &[1, 1, 1, 1], &[0.9, 0.8, 0.7, 0.6], 160, 16000)
             .unwrap();
         assert_eq!(result.text, "like 100");
+    }
+
+    /// `<unk>` is the model saying it has no spelling for a sound: never text, never a word. Kept
+    /// as text it was typed into the user's document (Parakeet Ultra emits it around quoted foreign
+    /// words: 73 times in 24 FLEURS clips, 2026-11-23).
+    #[test]
+    fn unk_is_never_text_or_a_word() {
+        let vocab = make_vocab(&["▁the", "<unk>", "▁dog", "<unk>"]);
+        let decoder = ParakeetTDTDecoder::from_vocab(vocab);
+        let result = decoder
+            .decode_with_timestamps(&[0, 1, 2, 3], &[0, 1, 2, 3], &[1, 1, 1, 1], &[0.9, 0.8, 0.7, 0.6], 160, 16000)
+            .unwrap();
+        assert_eq!(result.text, "the dog");
+        assert!(result.tokens.iter().all(|t| !t.text.contains("<unk>")), "{:?}", result.tokens);
+        assert_eq!(result.tokens.len(), 2);
     }
 
     #[test]
