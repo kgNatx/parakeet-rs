@@ -176,8 +176,11 @@ pub(crate) mod fixture {
 mod tests {
     use super::*;
 
-    const REAL_VOCAB: &str =
-        r"C:\Users\geisl\AppData\Roaming\speakey\app\data\models\parakeet-tdt-v3\vocab.txt";
+    /// The installed v3 vocabulary, found through `%APPDATA%` so no user's path is written here.
+    fn real_vocab() -> std::path::PathBuf {
+        let app_data = std::env::var_os("APPDATA").unwrap_or_default();
+        Path::new(&app_data).join(r"speakey\app\data\models\parakeet-tdt-v3\vocab.txt")
+    }
     const REAL_TOKENIZER: &str = r"E:\speech-eval\tokenizer-nvidia-v3\tokenizer.json";
 
     fn vocab(v: &[&str]) -> Vec<String> {
@@ -203,9 +206,10 @@ mod tests {
 
     /// The real model vocabulary and NVIDIA's tokenizer for it, when both are present.
     fn real() -> Option<(Vec<String>, usize, Speller)> {
-        let (vp, tp) = (Path::new(REAL_VOCAB), Path::new(REAL_TOKENIZER));
+        let vocab_path = real_vocab();
+        let (vp, tp) = (vocab_path.as_path(), Path::new(REAL_TOKENIZER));
         if !vp.exists() || !tp.exists() {
-            eprintln!("skipped: needs {REAL_VOCAB} and {REAL_TOKENIZER}");
+            eprintln!("skipped: needs {} and {REAL_TOKENIZER}", vp.display());
             return None;
         }
         let v = crate::vocab::Vocabulary::from_file(vp).unwrap().id_to_token;
